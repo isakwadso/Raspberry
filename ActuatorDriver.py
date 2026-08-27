@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+---
 Drive the Actuonix S20-100-38-B linear actuator back and forth through a
 DRV8825 stepper driver, with selectable microstepping, sleep control, and
 a fault (FLT) watchdog wired in from the start.
