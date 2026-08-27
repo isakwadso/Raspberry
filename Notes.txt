@@ -1,0 +1,10 @@
+Quick lines
+
+ssh biometric@BiometricRaspberryPi.local
+ping BiometricRaspberryPi.local
+
+python3 blink.py
+
+Stegmotordrivare: https://www.electrokit.com/stegmotordrivare-drv8825
+Hjälpsida för den: https://github.com/gavinlyonsrepo/RpiMotorLib/blob/master/extra/Documentation/Nema11DRV8825.md
+
