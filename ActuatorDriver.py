@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
----
 Drive the Actuonix S20-100-38-B linear actuator back and forth through a
 DRV8825 stepper driver, with selectable microstepping, sleep control, and
 a fault (FLT) watchdog wired in from the start.
@@ -61,7 +60,7 @@ FAULT_PIN = 17
 # Motion configuration
 # ---------------------------------------------------------------------------
 FULL_STEP_MM = 0.01         # from the Actuonix S20 datasheet: 0.01 mm per full step
-TRAVEL_MM = 2            # distance to travel each way -- keep this well inside the
+TRAVEL_MM = 2.0            # distance to travel each way -- keep this well inside the
                              # actuator's real end-of-travel until you've confirmed the
                              # safe range on the bench
 BASE_STEP_DELAY = 0.0020    # seconds per half-pulse at full step -- this is the speed
@@ -95,19 +94,27 @@ def _on_fault(channel):
 def setup_gpio():
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)  # we deliberately re-touch already-claimed pins below
-    GPIO.setup(SLEEP_PIN, GPIO.OUT)
+
+    # rpi-lgpio (the RPi.GPIO-compatible shim on Raspberry Pi OS Trixie) has a
+    # real bug: GPIO.setup(pin, GPIO.OUT) with no explicit `initial=` tries to
+    # READ the pin's current value before claiming it (to preserve state),
+    # and that read fails with "GPIO not allocated" if the pin has never been
+    # claimed by anything yet. Always passing initial= skips that broken
+    # read-before-claim path entirely, regardless of the pin's prior state.
+    GPIO.setup(SLEEP_PIN, GPIO.OUT, initial=GPIO.LOW)
     GPIO.setup(FAULT_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.add_event_detect(FAULT_PIN, GPIO.FALLING, callback=_on_fault, bouncetime=50)
 
-    # rpi-lgpio (the RPi.GPIO-compatible shim used on Raspberry Pi OS Trixie)
-    # has a bug/limitation when RpiMotorLib sets up the three microstep pins
-    # as a single batched call (GPIO.setup(self.mode_pins, GPIO.OUT)) -- it
-    # tries to read a pin's state before it has ever been claimed, which the
-    # underlying lgpio backend rejects with "GPIO not allocated". Claiming
-    # each pin individually here first works around it: RpiMotorLib's later
-    # batched re-setup just re-touches already-claimed pins instead.
+    # Pre-claim RpiMotorLib's own pins too (DIR/STEP/mode pins) with an
+    # explicit initial=, since RpiMotorLib's internal setup() calls don't
+    # pass one and would otherwise hit the same bug the first time it
+    # touches them -- including the mode pins, which it also sets up as a
+    # batch (GPIO.setup(self.mode_pins, GPIO.OUT)), another path that hits
+    # this same bug on a never-claimed pin.
+    GPIO.setup(DIR_PIN, GPIO.OUT, initial=GPIO.LOW)
+    GPIO.setup(STEP_PIN, GPIO.OUT, initial=GPIO.LOW)
     for pin in MODE_PINS:
-        GPIO.setup(pin, GPIO.OUT)
+        GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
 
     wake()
 
