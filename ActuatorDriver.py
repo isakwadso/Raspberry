@@ -58,12 +58,12 @@ FAULT_PIN = 17
 # Motion configuration
 # ---------------------------------------------------------------------------
 FULL_STEP_MM = 0.01         # from the Actuonix S20 datasheet: 0.01 mm per full step
-TRAVEL_MM = 40.0            # distance to travel each way -- keep well inside the
+TRAVEL_MM = 10           # distance to travel each way -- keep well inside the
                              # actuator's real end-of-travel until confirmed safe
 BASE_STEP_DELAY = 0.0020    # seconds per half-pulse at full step; scaled down as
                              # microstepping gets finer so real speed stays similar
-CYCLES = 5
-CLOCKWISE_EXTENDS = True    # flip if the first test move goes the wrong way
+CYCLES = 1
+CLOCKWISE_EXTENDS = False    # flip if the first test move goes the wrong way
 
 # microstep divisor -> (M0, M1, M2) levels, per the DRV8825 truth table
 MICROSTEP_OPTIONS = {
