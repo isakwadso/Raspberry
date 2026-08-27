@@ -35,7 +35,7 @@ signals (plus FLT, which is fine on either side) sit on odd pins instead:
     "GPIO17" (used here for FLT, which actually lives at physical pin 11) --
     the numbers just look alike.
 
-Requires, on the Raspberry:
+Requires:
     pip install RpiMotorLib RPi.GPIO --break-system-packages
 
 Direction note: whether `clockwise=True` extends or retracts the actuator
@@ -60,7 +60,7 @@ FAULT_PIN = 17
 # Motion configuration
 # ---------------------------------------------------------------------------
 FULL_STEP_MM = 0.01         # from the Actuonix S20 datasheet: 0.01 mm per full step
-TRAVEL_MM = 1.0            # distance to travel each way -- keep this well inside the
+TRAVEL_MM = 2            # distance to travel each way -- keep this well inside the
                              # actuator's real end-of-travel until you've confirmed the
                              # safe range on the bench
 BASE_STEP_DELAY = 0.0020    # seconds per half-pulse at full step -- this is the speed
@@ -93,9 +93,21 @@ def _on_fault(channel):
 
 def setup_gpio():
     GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)  # we deliberately re-touch already-claimed pins below
     GPIO.setup(SLEEP_PIN, GPIO.OUT)
     GPIO.setup(FAULT_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.add_event_detect(FAULT_PIN, GPIO.FALLING, callback=_on_fault, bouncetime=50)
+
+    # rpi-lgpio (the RPi.GPIO-compatible shim used on Raspberry Pi OS Trixie)
+    # has a bug/limitation when RpiMotorLib sets up the three microstep pins
+    # as a single batched call (GPIO.setup(self.mode_pins, GPIO.OUT)) -- it
+    # tries to read a pin's state before it has ever been claimed, which the
+    # underlying lgpio backend rejects with "GPIO not allocated". Claiming
+    # each pin individually here first works around it: RpiMotorLib's later
+    # batched re-setup just re-touches already-claimed pins instead.
+    for pin in MODE_PINS:
+        GPIO.setup(pin, GPIO.OUT)
+
     wake()
 
 
