@@ -11,10 +11,15 @@ Wiring is UNCHANGED from before -- same pins, same physical connections
     STP          Step pulse        12 (even)          GPIO18
     DIR          Direction         16 (even)          GPIO23
     SLP          Sleep             18 (even)          GPIO24
-    M0           Microstep bit 0   22 (even)          GPIO25
+    M0           Microstep bit 0    7 (odd)           GPIO4
     M1           Microstep bit 1   15 (odd)           GPIO22
     M2           Microstep bit 2   13 (odd)           GPIO27
     FLT          Fault (input)     11 (odd)           GPIO17
+
+    NOTE: M0 was originally GPIO25 (physical pin 22), but that pin is
+    permanently claimed as a "dc" (data/command) line by the Adafruit PiTFT
+    touchscreen overlay already enabled in this Pi's boot config -- moved to
+    GPIO4 instead, confirmed free via `gpioinfo`.
 
     RST          Reset             -> Pi 3.3V (physical pin 1 or 17), hardwired,
                                        always released
@@ -45,7 +50,7 @@ from gpiozero import DigitalOutputDevice, DigitalInputDevice
 # ---------------------------------------------------------------------------
 DIR_PIN = 23
 STEP_PIN = 18
-MODE_PINS = (25, 22, 27)    # M0, M1, M2
+MODE_PINS = (4, 22, 27)     # M0, M1, M2
 SLEEP_PIN = 24
 FAULT_PIN = 17
 
