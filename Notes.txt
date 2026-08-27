@@ -6,5 +6,20 @@ ping BiometricRaspberryPi.local
 python3 blink.py
 
 Stegmotordrivare: https://www.electrokit.com/stegmotordrivare-drv8825
-Hjälpsida för den: https://github.com/gavinlyonsrepo/RpiMotorLib/blob/master/extra/Documentation/Nema11DRV8825.md
+Hjälpsida för bibliotek: https://github.com/gavinlyonsrepo/RpiMotorLib/blob/master/extra/Documentation/Nema11DRV8825.md
 
+Virtual environment: 
+cd ~/Raspberry
+
+# create a virtual environment named "env" in this folder
+python3 -m venv env
+
+# activate it (your prompt will change to show "(env)" at the start)
+source env/bin/activate
+
+# now a plain pip install works, no --break-system-packages needed,
+# because this venv isn't the OS-managed Python anymore
+pip install RpiMotorLib RPi.GPIO
+
+# run your script while the venv is active
+python3 ActuatorDriver.py
