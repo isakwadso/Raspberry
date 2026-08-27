@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """
 Drive the Actuonix S20-100-38-B linear actuator back and forth through a
-DRV8825 stepper driver, with selectable microstepping, sleep control, and
-a fault (FLT) watchdog wired in from the start.
+DRV8825 stepper driver, using gpiozero instead of RPi.GPIO/RpiMotorLib.
 
-Pin map (BCM numbering) -- kept within physical pins 1-26, UART (pins 8/10),
-I2C (pins 3/5) and SPI (pins 19/21/23/24/26) left completely free. As many
-signals as possible land on even physical pins for easier wiring, but with
-UART/SPI off-limits only 4 even pins remain, so two of the six control
-signals (plus FLT, which is fine on either side) sit on odd pins instead:
+Wiring is UNCHANGED from before -- same pins, same physical connections
+(BCM numbering, physical pins 1-26 only):
 
     Driver pin   Function          Pi physical pin   BCM GPIO
     ----------   ---------------   ----------------   --------
@@ -22,30 +18,27 @@ signals (plus FLT, which is fine on either side) sit on odd pins instead:
 
     RST          Reset             -> Pi 3.3V (physical pin 1 or 17), hardwired,
                                        always released
-    EN           Enable            -> any Pi GND pin (e.g. pin 6), hardwired, always
-                                       enabled -- SLP is used instead to power the
-                                       coils down between moves
-    GND (logic)  Ground            -> any Pi GND pin, shared with EN's ground wire
+    EN           Enable            -> any Pi GND pin, hardwired, always enabled --
+                                       SLEEP is what actually powers the coils
+                                       down between moves
+    GND (logic)  Ground            -> any Pi GND pin
     VMOT / GND   Motor power       -> external ~12V supply, NOT the Pi
-
     1A / 1B      Coil 1            -> actuator Blue / Red
     2A / 2B      Coil 2            -> actuator Green / Black
 
-    Note: physical pin 17 (3.3V, used for RST) is NOT the same as BCM
-    "GPIO17" (used here for FLT, which actually lives at physical pin 11) --
-    the numbers just look alike.
+SAFETY NOTE: SLEEP is asserted LOW (driver asleep, coils de-energized) the
+instant this module creates its device objects -- i.e. before any of our own
+logic runs -- specifically to avoid the coils ever being left energized in
+an undefined state if the script is interrupted before main() gets going.
 
 Requires:
-    pip install RpiMotorLib RPi.GPIO --break-system-packages
-
-Direction note: whether `clockwise=True` extends or retracts the actuator
-depends on which coil wire landed on 1A vs 1B (and 2A vs 2B). Run one short
-move and flip the CLOCKWISE_EXTENDS constant below if it moves the wrong way.
+    pip install gpiozero
+    (gpiozero picks whichever pin factory is installed; on Raspberry Pi OS
+    Trixie that's lgpio via the python3-lgpio package you already have.)
 """
 
 import time
-import RPi.GPIO as GPIO
-from RpiMotorLib import RpiMotorLib
+from gpiozero import DigitalOutputDevice, DigitalInputDevice
 
 # ---------------------------------------------------------------------------
 # Pin configuration
@@ -60,72 +53,61 @@ FAULT_PIN = 17
 # Motion configuration
 # ---------------------------------------------------------------------------
 FULL_STEP_MM = 0.01         # from the Actuonix S20 datasheet: 0.01 mm per full step
-TRAVEL_MM = 2.0            # distance to travel each way -- keep this well inside the
-                             # actuator's real end-of-travel until you've confirmed the
-                             # safe range on the bench
-BASE_STEP_DELAY = 0.0020    # seconds per half-pulse at full step -- this is the speed
-                             # reference; it's scaled down automatically as microstepping
-                             # gets finer so real-world speed (mm/s) stays roughly constant
-CYCLES = 1
-CLOCKWISE_EXTENDS = True    # flip this if the first test move goes the wrong way
+TRAVEL_MM = 40.0            # distance to travel each way -- keep well inside the
+                             # actuator's real end-of-travel until confirmed safe
+BASE_STEP_DELAY = 0.0020    # seconds per half-pulse at full step; scaled down as
+                             # microstepping gets finer so real speed stays similar
+CYCLES = 5
+CLOCKWISE_EXTENDS = True    # flip if the first test move goes the wrong way
 
-# steptype string RpiMotorLib expects for each microstep divisor
+# microstep divisor -> (M0, M1, M2) levels, per the DRV8825 truth table
 MICROSTEP_OPTIONS = {
-    1:  "Full",
-    2:  "Half",
-    4:  "1/4",
-    8:  "1/8",
-    16: "1/16",
+    1:  (0, 0, 0),
+    2:  (1, 0, 0),
+    4:  (0, 1, 0),
+    8:  (1, 1, 0),
+    16: (0, 0, 1),
 }
 
-SLEEP_WAKE_DELAY = 0.005    # DRV8825 needs ~1.7ms after leaving sleep before the first
-                             # step is valid; 5ms gives comfortable headroom
+SLEEP_WAKE_DELAY = 0.005    # DRV8825 needs ~1.7ms after leaving sleep before the
+                             # first step is valid; 5ms gives headroom
 
 fault_triggered = False
 
+# ---------------------------------------------------------------------------
+# Devices -- created with an explicit initial state so nothing is ever left
+# energized in an undefined state. SLEEP starts LOW (asleep) immediately.
+# ---------------------------------------------------------------------------
+step = DigitalOutputDevice(STEP_PIN, initial_value=False)
+direction = DigitalOutputDevice(DIR_PIN, initial_value=False)
+sleep_pin = DigitalOutputDevice(SLEEP_PIN, initial_value=False)   # starts asleep
+mode = [DigitalOutputDevice(pin, initial_value=False) for pin in MODE_PINS]
+fault = DigitalInputDevice(FAULT_PIN, pull_up=True)   # pull_up=True -> "active"
+                                                        # means the pin read LOW
 
-def _on_fault(channel):
+
+def _on_fault():
     global fault_triggered
     fault_triggered = True
     print("!! DRV8825 FLT pin went low -- driver reports a fault (overcurrent, "
           "thermal shutdown, or undervoltage lockout). Motion will stop.")
 
 
-def setup_gpio():
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setwarnings(False)  # we deliberately re-touch already-claimed pins below
-
-    # rpi-lgpio (the RPi.GPIO-compatible shim on Raspberry Pi OS Trixie) has a
-    # real bug: GPIO.setup(pin, GPIO.OUT) with no explicit `initial=` tries to
-    # READ the pin's current value before claiming it (to preserve state),
-    # and that read fails with "GPIO not allocated" if the pin has never been
-    # claimed by anything yet. Always passing initial= skips that broken
-    # read-before-claim path entirely, regardless of the pin's prior state.
-    GPIO.setup(SLEEP_PIN, GPIO.OUT, initial=GPIO.LOW)
-    GPIO.setup(FAULT_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.add_event_detect(FAULT_PIN, GPIO.FALLING, callback=_on_fault, bouncetime=50)
-
-    # Pre-claim RpiMotorLib's own pins too (DIR/STEP/mode pins) with an
-    # explicit initial=, since RpiMotorLib's internal setup() calls don't
-    # pass one and would otherwise hit the same bug the first time it
-    # touches them -- including the mode pins, which it also sets up as a
-    # batch (GPIO.setup(self.mode_pins, GPIO.OUT)), another path that hits
-    # this same bug on a never-claimed pin.
-    GPIO.setup(DIR_PIN, GPIO.OUT, initial=GPIO.LOW)
-    GPIO.setup(STEP_PIN, GPIO.OUT, initial=GPIO.LOW)
-    for pin in MODE_PINS:
-        GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
-
-    wake()
+fault.when_activated = _on_fault
 
 
 def wake():
-    GPIO.output(SLEEP_PIN, GPIO.HIGH)
+    sleep_pin.on()
     time.sleep(SLEEP_WAKE_DELAY)
 
 
 def sleep_driver():
-    GPIO.output(SLEEP_PIN, GPIO.LOW)
+    sleep_pin.off()
+
+
+def set_microstep(divisor):
+    for pin, bit in zip(mode, MICROSTEP_OPTIONS[divisor]):
+        pin.value = bit
 
 
 def steps_for_travel(microstep_divisor, travel_mm):
@@ -133,7 +115,7 @@ def steps_for_travel(microstep_divisor, travel_mm):
     return int(round(travel_mm / mm_per_step))
 
 
-def move(motor, steps, extend, microstep_divisor):
+def move(steps, extend, microstep_divisor):
     global fault_triggered
     if fault_triggered:
         print("Refusing to move: a fault is still latched. Power-cycle VMOT and "
@@ -141,20 +123,18 @@ def move(motor, steps, extend, microstep_divisor):
         return False
 
     clockwise = extend if CLOCKWISE_EXTENDS else (not extend)
-    stepdelay = BASE_STEP_DELAY / microstep_divisor
+    direction.value = clockwise
+    step_delay = BASE_STEP_DELAY / microstep_divisor
 
-    motor.motor_go(
-        clockwise=clockwise,
-        steptype=MICROSTEP_OPTIONS[microstep_divisor],
-        steps=steps,
-        stepdelay=stepdelay,
-        verbose=False,
-        initdelay=0.05,
-    )
+    for _ in range(steps):
+        if fault_triggered:
+            print("Fault occurred during the move -- stopping.")
+            return False
+        step.on()
+        time.sleep(step_delay)
+        step.off()
+        time.sleep(step_delay)
 
-    if fault_triggered:
-        print("Fault occurred during the move -- stopping.")
-        return False
     return True
 
 
@@ -162,12 +142,11 @@ def main(microstep_divisor=8):
     if microstep_divisor not in MICROSTEP_OPTIONS:
         raise ValueError(f"microstep_divisor must be one of {sorted(MICROSTEP_OPTIONS)}")
 
-    setup_gpio()
-    motor = RpiMotorLib.A4988Nema(DIR_PIN, STEP_PIN, MODE_PINS, motor_type="DRV8825")
+    set_microstep(microstep_divisor)
+    wake()
 
     steps = steps_for_travel(microstep_divisor, TRAVEL_MM)
-    print(f"Microstepping: 1/{microstep_divisor} ({MICROSTEP_OPTIONS[microstep_divisor]}), "
-          f"{steps} steps per {TRAVEL_MM}mm move")
+    print(f"Microstepping: 1/{microstep_divisor}, {steps} steps per {TRAVEL_MM}mm move")
 
     try:
         for cycle in range(1, CYCLES + 1):
@@ -175,18 +154,20 @@ def main(microstep_divisor=8):
                 break
 
             print(f"Cycle {cycle}: extending")
-            if not move(motor, steps, extend=True, microstep_divisor=microstep_divisor):
+            if not move(steps, extend=True, microstep_divisor=microstep_divisor):
                 break
             time.sleep(0.5)
 
             print(f"Cycle {cycle}: retracting")
-            if not move(motor, steps, extend=False, microstep_divisor=microstep_divisor):
+            if not move(steps, extend=False, microstep_divisor=microstep_divisor):
                 break
             time.sleep(0.5)
 
     finally:
         sleep_driver()
-        GPIO.cleanup()
+        step.off()
+        for device in (step, direction, sleep_pin, fault, *mode):
+            device.close()
 
 
 if __name__ == "__main__":
