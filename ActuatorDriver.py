@@ -137,6 +137,7 @@ def home_actuator(tic, microstep_divisor):
     time.sleep(max_travel_time_s + HOME_SETTLE_S)
 
     tic.halt_and_set_position(0)
+    tic.exit_safe_start()
     print("Homed: re-zeroed against the retracted hard stop.")
 
 
