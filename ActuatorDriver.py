@@ -40,6 +40,32 @@ TARGET_SPEED_MM_S = 4.0     # real-world speed target, held constant across
 RAMP_TIME_S = 0.3           # time to accelerate from starting speed to target speed
 CYCLES = 2
 
+# ---------------------------------------------------------------------------
+# Homing configuration
+# ---------------------------------------------------------------------------
+# The Tic runs open-loop -- it has no way to know whether a commanded move
+# actually completed or the motor stalled partway through. A stall (e.g.
+# against the actuator's hard stop, or under unexpected load) doesn't error
+# out or slow the Tic's own position counter, so its belief about where the
+# actuator is can silently drift from reality. The only way to regain real
+# ground truth without limit switches or an encoder is to deliberately drive
+# into a known physical reference (here, the actuator's retracted hard stop)
+# and re-zero there.
+#
+# Make sure the actuator has full clearance to retract before running this
+# -- homing intentionally drives it into that end stop.
+HOME_OVERTRAVEL_MM = 10.0    # commanded distance past the actuator's real
+                             # travel when homing -- guarantees it reaches
+                             # and stalls against the physical retracted end
+                             # stop well before the commanded distance
+HOME_SPEED_MM_S = 1.0        # slow, gentle speed for driving into the hard
+                             # stop -- much slower than TARGET_SPEED_MM_S
+HOME_SETTLE_S = 0.5          # extra time held against the stop before
+                             # re-zeroing, so the stall is unambiguous
+RECOVER_FROM_STALL = True    # if a move times out mid-cycle (see
+                             # wait_until_arrived), re-home before trusting
+                             # position again rather than continuing blind
+
 # microstep divisor -> Tic's "Set step mode" protocol value (confirmed against
 # Pololu's Tic command reference: 0=Full, 1=1/2, 2=1/4, 3=1/8, 4=1/16, 5=1/32)
 STEP_MODE_VALUES = {
@@ -84,6 +110,36 @@ def configure_motion(tic, microstep_divisor):
     return int(round(TRAVEL_MM / mm_per_step))  # steps for the full travel distance
 
 
+def home_actuator(tic, microstep_divisor):
+    """Re-establish a known zero position by driving into the actuator's
+    physical retracted hard stop and re-zeroing there.
+
+    This deliberately commands a target well beyond the actuator's real
+    travel, at reduced speed, so it is guaranteed to hit the hard stop and
+    stall out before the commanded distance is reached. We don't (and can't)
+    wait for the Tic to report arrival -- that would never happen, by
+    design -- we just wait long enough for the stall to certainly have
+    happened, plus a short settle, then call halt_and_set_position(0) to
+    treat wherever the actuator physically is right now as the new zero.
+
+    Note this overrides the max speed set by configure_motion(); call
+    configure_motion() again afterward to restore the normal move profile
+    before commanding further moves.
+    """
+    mm_per_step = FULL_STEP_MM / microstep_divisor
+    home_target_steps = -int(round(HOME_OVERTRAVEL_MM / mm_per_step))
+    home_speed_steps_per_sec = HOME_SPEED_MM_S / mm_per_step
+
+    tic.set_max_speed(int(home_speed_steps_per_sec * 10000))
+    tic.set_target_position(home_target_steps)
+
+    max_travel_time_s = HOME_OVERTRAVEL_MM / HOME_SPEED_MM_S
+    time.sleep(max_travel_time_s + HOME_SETTLE_S)
+
+    tic.halt_and_set_position(0)
+    print("Homed: re-zeroed against the retracted hard stop.")
+
+
 def wait_until_arrived(tic, timeout=MOVE_TIMEOUT_S):
     elapsed = 0.0
     while tic.get_current_position() != tic.get_target_position():
@@ -112,14 +168,7 @@ def move_to(tic, position):
 def main(microstep_divisor=8):
     tic = TicUSB()
 
-    steps = configure_motion(tic, microstep_divisor)
-    print(f"Microstepping: 1/{microstep_divisor}, {steps} steps per {TRAVEL_MM}mm move, "
-          f"target speed {TARGET_SPEED_MM_S} mm/s")
-
     try:
-        tic.halt_and_set_position(0)   # treats the current physical position as
-                                        # "0" -- not true homing, so start from a
-                                        # known-safe position the first time
         tic.energize()
         tic.exit_safe_start()
 
@@ -135,15 +184,37 @@ def main(microstep_divisor=8):
                   f"human-readable breakdown.")
             return
 
+        steps = configure_motion(tic, microstep_divisor)
+        print(f"Microstepping: 1/{microstep_divisor}, {steps} steps per {TRAVEL_MM}mm move, "
+              f"target speed {TARGET_SPEED_MM_S} mm/s")
+
+        # Replaces the old "assume you started from a known-safe position"
+        # halt_and_set_position(0) -- this actually re-establishes zero
+        # against a physical reference instead of just trusting wherever the
+        # actuator happened to be when the script started.
+        print("Homing: driving into the retracted hard stop to establish a known zero...")
+        home_actuator(tic, microstep_divisor)
+        steps = configure_motion(tic, microstep_divisor)  # restore normal speed/accel after homing's slower profile
+
         for cycle in range(1, CYCLES + 1):
             print(f"Cycle {cycle}: extending")
             if not move_to(tic, steps):
-                break
+                if not RECOVER_FROM_STALL:
+                    break
+                print("  Move may have stalled -- re-homing to recover a known position.")
+                home_actuator(tic, microstep_divisor)
+                steps = configure_motion(tic, microstep_divisor)
+                continue
             time.sleep(0.5)
 
             print(f"Cycle {cycle}: retracting")
             if not move_to(tic, 0):
-                break
+                if not RECOVER_FROM_STALL:
+                    break
+                print("  Move may have stalled -- re-homing to recover a known position.")
+                home_actuator(tic, microstep_divisor)
+                steps = configure_motion(tic, microstep_divisor)
+                continue
             time.sleep(0.5)
 
     finally:
