@@ -37,8 +37,8 @@ from ticlib import TicUSB
 # Motion configuration
 # ---------------------------------------------------------------------------
 FULL_STEP_MM = 0.01         # from the Actuonix S20 datasheet: 0.01mm per full step
-TARGET_SPEED_MM_S = 5.0     # real-world speed target, held constant across
-                             # whichever microstep resolution you pick
+TARGET_SPEED_MM_S = 6.0     # real-world speed target, held constant across
+                            # whichever microstep resolution you pick
 RAMP_TIME_S = 0.3           # time to accelerate from starting speed to target speed
 
 MIN_POSITION_MM = 0.0       # 0 = the homed (retracted hard stop) position
@@ -61,13 +61,13 @@ MAX_POSITION_MM = 100.0      # keep well inside the actuator's real end-of-trave
 #
 # Make sure the actuator has full clearance to retract before running this
 # -- homing intentionally drives it into that end stop.
-HOME_OVERTRAVEL_MM = 15.0    # commanded distance past the actuator's real
+HOME_OVERTRAVEL_MM = 5.0    # commanded distance past the actuator's real
                              # travel when homing -- guarantees it reaches
                              # and stalls against the physical retracted end
                              # stop well before the commanded distance
 HOME_SPEED_MM_S = 1.0        # slow, gentle speed for driving into the hard
                              # stop -- much slower than TARGET_SPEED_MM_S
-HOME_SETTLE_S = 1.0          # extra time held against the stop before
+HOME_SETTLE_S = 0.5          # extra time held against the stop before
                              # re-zeroing, so the stall is unambiguous
 RECOVER_FROM_STALL = True    # if a move times out mid-cycle (see
                              # wait_until_arrived), re-home before trusting
@@ -136,10 +136,22 @@ def home_actuator(tic, microstep_divisor):
     home_speed_steps_per_sec = HOME_SPEED_MM_S / mm_per_step
 
     tic.set_max_speed(int(home_speed_steps_per_sec * 10000))
+    tic.exit_safe_start()  # see move_to() -- guards against a command-timeout
+                            # having re-armed safe-start while we were idle
+                            # sitting at the interactive prompt
     tic.set_target_position(home_target_steps)
 
+    # Deliberately not a single time.sleep() -- a long uninterrupted sleep
+    # leaves nobody feeding the Tic's command-timeout watchdog, which can
+    # trip and halt the motor early, well before it actually reaches the
+    # hard stop. Poll in small steps and ping reset_command_timeout(), the
+    # same way wait_until_arrived() does for a normal move.
     max_travel_time_s = HOME_OVERTRAVEL_MM / HOME_SPEED_MM_S
-    time.sleep(max_travel_time_s + HOME_SETTLE_S)
+    elapsed = 0.0
+    while elapsed < max_travel_time_s + HOME_SETTLE_S:
+        tic.reset_command_timeout()
+        time.sleep(0.05)
+        elapsed += 0.05
 
     tic.halt_and_set_position(0)
 
@@ -174,6 +186,13 @@ def wait_until_arrived(tic, timeout=MOVE_TIMEOUT_S):
 
 
 def move_to(tic, position):
+    # Sitting idle at the interactive prompt between moves can be long
+    # enough for the Tic's command-timeout watchdog to trip on its own,
+    # which (like halt_and_set_position()) re-arms the safe-start
+    # interlock. Calling exit_safe_start() here is a no-op if it wasn't
+    # needed, and clears the timeout condition either way since it's a
+    # valid command.
+    tic.exit_safe_start()
     tic.set_target_position(position)
     return wait_until_arrived(tic)
 
