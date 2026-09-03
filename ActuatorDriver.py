@@ -33,7 +33,7 @@ from ticlib import TicUSB
 # Motion configuration
 # ---------------------------------------------------------------------------
 FULL_STEP_MM = 0.01         # from the Actuonix S20 datasheet: 0.01mm per full step
-TRAVEL_MM = 5.0           # distance to travel each way -- keep well inside the
+TRAVEL_MM = 40.0          # distance to travel each way -- keep well inside the
                              # actuator's real end-of-travel until confirmed safe
 TARGET_SPEED_MM_S = 4.0     # real-world speed target, held constant across
                              # whichever microstep resolution you pick
