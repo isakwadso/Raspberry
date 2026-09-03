@@ -62,7 +62,7 @@ HOME_SPEED_MM_S = 2.0        # slow, gentle speed for driving into the hard
                              # stop -- much slower than TARGET_SPEED_MM_S
 HOME_SETTLE_S = 0.5          # extra time held against the stop before
                              # re-zeroing, so the stall is unambiguous
-RECOVER_FROM_STALL = True    # if a move times out mid-cycle (see
+RECOVER_FROM_STALL = False    # if a move times out mid-cycle (see
                              # wait_until_arrived), re-home before trusting
                              # position again rather than continuing blind
 
@@ -193,7 +193,7 @@ def main(microstep_divisor=8):
         # against a physical reference instead of just trusting wherever the
         # actuator happened to be when the script started.
         print("Homing: driving into the retracted hard stop to establish a known zero...")
-        #home_actuator(tic, microstep_divisor)
+        home_actuator(tic, microstep_divisor)
         steps = configure_motion(tic, microstep_divisor)  # restore normal speed/accel after homing's slower profile
 
         for cycle in range(1, CYCLES + 1):
