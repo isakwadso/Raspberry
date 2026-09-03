@@ -193,16 +193,16 @@ def main(microstep_divisor=8):
         # against a physical reference instead of just trusting wherever the
         # actuator happened to be when the script started.
         print("Homing: driving into the retracted hard stop to establish a known zero...")
-        home_actuator(tic, microstep_divisor)
+        #home_actuator(tic, microstep_divisor)
         steps = configure_motion(tic, microstep_divisor)  # restore normal speed/accel after homing's slower profile
 
         for cycle in range(1, CYCLES + 1):
             print(f"Cycle {cycle}: extending")
             if not move_to(tic, steps):
-                if not RECOVER_FROM_STALL:
-                    break
-                print("  Move may have stalled -- re-homing to recover a known position.")
-                home_actuator(tic, microstep_divisor)
+                #if not RECOVER_FROM_STALL:
+                #    break
+                #print("  Move may have stalled -- re-homing to recover a known position.")
+                #home_actuator(tic, microstep_divisor)
                 steps = configure_motion(tic, microstep_divisor)
                 continue
             time.sleep(0.5)
