@@ -53,6 +53,14 @@ STEP_MODE_VALUES = {
 MOVE_TIMEOUT_S = 15
 
 
+def error_status_int(value):
+    """The installed ticlib version returns get_error_status() as an
+    array.array rather than a plain int -- normalize either form to int."""
+    if isinstance(value, int):
+        return value
+    return int.from_bytes(bytes(value), 'little')
+
+
 def configure_motion(tic, microstep_divisor):
     """Set step mode and a speed/accel profile that gives ~TARGET_SPEED_MM_S
     regardless of which microstep resolution is chosen."""
@@ -79,7 +87,7 @@ def configure_motion(tic, microstep_divisor):
 def wait_until_arrived(tic, timeout=MOVE_TIMEOUT_S):
     elapsed = 0.0
     while tic.get_current_position() != tic.get_target_position():
-        error = tic.get_error_status()
+        error = error_status_int(tic.get_error_status())
         if error:
             print(f"!! Tic reports an active error (status bits: {error:#06x}) -- "
                   f"stopping. Check Tic Control Center or `ticcmd -s` for details.")
@@ -116,7 +124,7 @@ def main(microstep_divisor=8):
         # error before exit_safe_start() is called, which isn't a real fault.
         # Anything still reported here is a genuine issue (e.g. Low VIN if
         # the motor power supply isn't connected).
-        error = tic.get_error_status()
+        error = error_status_int(tic.get_error_status())
         if error:
             print(f"Tic reports an error after exit_safe_start (status bits: "
                   f"{error:#06x}) -- run `ticcmd -s` in another terminal for a "
