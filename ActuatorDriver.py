@@ -100,12 +100,6 @@ def move_to(tic, position):
 def main(microstep_divisor=8):
     tic = TicUSB()
 
-    error = tic.get_error_status()
-    if error:
-        print(f"Tic already reports an error before starting (status bits: "
-              f"{error:#06x}) -- check wiring/power before continuing.")
-        return
-
     steps = configure_motion(tic, microstep_divisor)
     print(f"Microstepping: 1/{microstep_divisor}, {steps} steps per {TRAVEL_MM}mm move, "
           f"target speed {TARGET_SPEED_MM_S} mm/s")
@@ -116,6 +110,18 @@ def main(microstep_divisor=8):
                                         # known-safe position the first time
         tic.energize()
         tic.exit_safe_start()
+
+        # Checking here (after exit_safe_start) rather than right after
+        # connecting -- a fresh Tic always reports a "safe start violation"
+        # error before exit_safe_start() is called, which isn't a real fault.
+        # Anything still reported here is a genuine issue (e.g. Low VIN if
+        # the motor power supply isn't connected).
+        error = tic.get_error_status()
+        if error:
+            print(f"Tic reports an error after exit_safe_start (status bits: "
+                  f"{error:#06x}) -- run `ticcmd -s` in another terminal for a "
+                  f"human-readable breakdown.")
+            return
 
         for cycle in range(1, CYCLES + 1):
             print(f"Cycle {cycle}: extending")
