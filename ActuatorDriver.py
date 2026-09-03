@@ -60,7 +60,7 @@ HOME_OVERTRAVEL_MM = 10.0    # commanded distance past the actuator's real
                              # stop well before the commanded distance
 HOME_SPEED_MM_S = 2.0        # slow, gentle speed for driving into the hard
                              # stop -- much slower than TARGET_SPEED_MM_S
-HOME_SETTLE_S = 0.5          # extra time held against the stop before
+#HOME_SETTLE_S = 0.5          # extra time held against the stop before
                              # re-zeroing, so the stall is unambiguous
 RECOVER_FROM_STALL = False    # if a move times out mid-cycle (see
                              # wait_until_arrived), re-home before trusting
@@ -133,8 +133,8 @@ def home_actuator(tic, microstep_divisor):
     tic.set_max_speed(int(home_speed_steps_per_sec * 10000))
     tic.set_target_position(home_target_steps)
 
-    max_travel_time_s = HOME_OVERTRAVEL_MM / HOME_SPEED_MM_S
-    time.sleep(max_travel_time_s + HOME_SETTLE_S)
+    #max_travel_time_s = HOME_OVERTRAVEL_MM / HOME_SPEED_MM_S
+    #time.sleep(max_travel_time_s + HOME_SETTLE_S)
 
     tic.halt_and_set_position(0)
     print("Homed: re-zeroed against the retracted hard stop.")
