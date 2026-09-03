@@ -58,7 +58,7 @@ HOME_OVERTRAVEL_MM = 10.0    # commanded distance past the actuator's real
                              # travel when homing -- guarantees it reaches
                              # and stalls against the physical retracted end
                              # stop well before the commanded distance
-HOME_SPEED_MM_S = 1.0        # slow, gentle speed for driving into the hard
+HOME_SPEED_MM_S = 2.0        # slow, gentle speed for driving into the hard
                              # stop -- much slower than TARGET_SPEED_MM_S
 HOME_SETTLE_S = 0.5          # extra time held against the stop before
                              # re-zeroing, so the stall is unambiguous
