@@ -54,7 +54,7 @@ CYCLES = 2
 #
 # Make sure the actuator has full clearance to retract before running this
 # -- homing intentionally drives it into that end stop.
-HOME_OVERTRAVEL_MM = 5.0    # commanded distance past the actuator's real
+HOME_OVERTRAVEL_MM = 10.0    # commanded distance past the actuator's real
                              # travel when homing -- guarantees it reaches
                              # and stalls against the physical retracted end
                              # stop well before the commanded distance
