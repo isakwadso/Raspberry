@@ -38,7 +38,7 @@ TRAVEL_MM = 40.0            # distance to travel each way -- keep well inside th
 TARGET_SPEED_MM_S = 4.0     # real-world speed target, held constant across
                              # whichever microstep resolution you pick
 RAMP_TIME_S = 0.3           # time to accelerate from starting speed to target speed
-CYCLES = 5
+CYCLES = 2
 
 # microstep divisor -> Tic's "Set step mode" protocol value (confirmed against
 # Pololu's Tic command reference: 0=Full, 1=1/2, 2=1/4, 3=1/8, 4=1/16, 5=1/32)
