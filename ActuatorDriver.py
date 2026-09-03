@@ -33,12 +33,12 @@ from ticlib import TicUSB
 # Motion configuration
 # ---------------------------------------------------------------------------
 FULL_STEP_MM = 0.01         # from the Actuonix S20 datasheet: 0.01mm per full step
-TRAVEL_MM = 40.0          # distance to travel each way -- keep well inside the
+TRAVEL_MM = 40.0            # distance to travel each way -- keep well inside the
                              # actuator's real end-of-travel until confirmed safe
 TARGET_SPEED_MM_S = 4.0     # real-world speed target, held constant across
                              # whichever microstep resolution you pick
 RAMP_TIME_S = 0.3           # time to accelerate from starting speed to target speed
-CYCLES = 2
+CYCLES = 5
 
 # microstep divisor -> Tic's "Set step mode" protocol value (confirmed against
 # Pololu's Tic command reference: 0=Full, 1=1/2, 2=1/4, 3=1/8, 4=1/16, 5=1/32)
@@ -87,6 +87,10 @@ def configure_motion(tic, microstep_divisor):
 def wait_until_arrived(tic, timeout=MOVE_TIMEOUT_S):
     elapsed = 0.0
     while tic.get_current_position() != tic.get_target_position():
+        # A long move can otherwise trip the Tic's own command-timeout
+        # watchdog, since it only saw one real command (set_target_position)
+        # at the very start -- this tells it the host is still present.
+        tic.reset_command_timeout()
         error = error_status_int(tic.get_error_status())
         if error:
             print(f"!! Tic reports an active error (status bits: {error:#06x}) -- "
