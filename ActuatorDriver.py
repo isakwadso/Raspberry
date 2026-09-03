@@ -153,4 +153,4 @@ def main(microstep_divisor=8):
 
 if __name__ == "__main__":
     # Set to 1, 2, 4, 8, or 16 for full, half, 1/4, 1/8, or 1/16 step
-    main(microstep_divisor=8)
+    main(microstep_divisor=16)
