@@ -76,26 +76,27 @@ class PiTFT:
     def __init__(self, rotation=0):
         spi = board.SPI()
 
+        # The touch chip tolerates far less SPI speed than the display; the
+        # library sets its own baudrate when it locks the bus, so the two
+        # coexist on SPI0 without interfering.
         self.touch = Adafruit_STMPE610_SPI(spi, digitalio.DigitalInOut(board.CE1))
-
+ 
         self.display = hx8357.HX8357(
             spi,
             cs=digitalio.DigitalInOut(board.CE0),
-            ...
+            dc=digitalio.DigitalInOut(board.D25),
+            rst=None,                      # not wired to a GPIO on the PiTFT
+            baudrate=SPI_BAUDRATE,
         )
         self.display.rotation = rotation
-
+ 
         # Take the size from the driver rather than hardcoding 480x320, so
         # this stays correct if the rotation is ever changed.
         self.width = self.display.width
         self.height = self.display.height
-
-        # The touch chip tolerates far less SPI speed than the display; the
-        # library sets its own baudrate when it locks the bus, so the two
-        # coexist on SPI0 without interfering.
-        #self.touch = Adafruit_STMPE610_SPI(spi, digitalio.DigitalInOut(board.CE1))
-
+ 
     # -- drawing ------------------------------------------------------------
+ 
 
     def draw_full(self, img):
         """Push a full-screen image. Roughly 0.1s with numpy present."""
