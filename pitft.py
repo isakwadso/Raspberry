@@ -59,6 +59,14 @@ TOUCH_PRESSURE_MIN = 20
 
 SPI_BAUDRATE = 24000000
 
+# HX8357D memory-access-control register. Set once at init so mirroring and
+# colour order are handled in hardware -- every draw, full or partial, is then
+# correct with no per-frame transform and no coordinate fiddling in
+# draw_region(). Determined empirically with madctl_test.py:
+#   0x20 MV  - row/column exchange, i.e. 480x320 landscape
+#   0x08 BGR - this panel wants BGR byte order, not RGB
+MADCTL_REG = 0x36
+MADCTL_VALUE = 0x28
 
 class PiTFT:
     """Owns both SPI devices on the PiTFT: the HX8357D display on CE0 and the
@@ -73,14 +81,13 @@ class PiTFT:
     hardware fault but is only bus contention.
     """
 
-    def __init__(self, rotation=0):
+    def __init__(self):
         spi = board.SPI()
 
-        # The touch chip tolerates far less SPI speed than the display; the
-        # library sets its own baudrate when it locks the bus, so the two
-        # coexist on SPI0 without interfering.
+        # Touch chip FIRST. Constructing the STMPE610 after the HX8357
+        # disturbs the display's initialisation and leaves the panel blank.
         self.touch = Adafruit_STMPE610_SPI(spi, digitalio.DigitalInOut(board.CE1))
- 
+
         self.display = hx8357.HX8357(
             spi,
             cs=digitalio.DigitalInOut(board.CE0),
@@ -88,10 +95,9 @@ class PiTFT:
             rst=None,                      # not wired to a GPIO on the PiTFT
             baudrate=SPI_BAUDRATE,
         )
-        self.display.rotation = rotation
- 
-        # Take the size from the driver rather than hardcoding 480x320, so
-        # this stays correct if the rotation is ever changed.
+        self.display.write(MADCTL_REG, bytes([MADCTL_VALUE]))
+
+        # Take the size from the driver rather than hardcoding 480x320.
         self.width = self.display.width
         self.height = self.display.height
  
