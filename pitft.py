@@ -46,7 +46,7 @@ from adafruit_stmpe610 import Adafruit_STMPE610_SPI
 # True  = diagnostic: the readout box redraws on a 500ms timer and the touch
 #         chip is NEVER read. If the creeping red lines appear in this mode,
 #         they are not caused by touch traffic on the shared SPI bus.
-TIMER_ONLY = True
+TIMER_ONLY = False
 # ===========================================================================
 
 
