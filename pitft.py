@@ -216,30 +216,6 @@ def main():
 
             time.sleep(0.02)    
     
-"""
-    try:
-        while True:
-            hit = None #tft.get_touch()
-            if hit and hit != last:
-                presses += 1
-                last = hit
-
-                # Only this 300x90 box is redrawn, not the whole screen.
-                box = Image.new("RGB", (READOUT_W, READOUT_H), (0, 0, 60))
-                bd = ImageDraw.Draw(box)
-                bd.rectangle((0, 0, READOUT_W - 1, READOUT_H - 1),
-                             outline=(120, 120, 255))
-                bd.text((15, 20), f"x={hit[0]}  y={hit[1]}", font=font, fill="white")
-                bd.text((15, 50), f"presses: {presses}", font=font, fill=(160, 160, 160))
-
-                t0 = time.monotonic()
-                tft.draw_region(box, readout_x, readout_y)
-                dt = time.monotonic() - t0
-
-                print(f"{hit}  partial redraw {dt * 1000:.0f}ms")
-
-            time.sleep(0.02)
-"""
     except KeyboardInterrupt:
         print("\nstopping")
     finally:
