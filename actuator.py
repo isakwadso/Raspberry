@@ -39,8 +39,8 @@ TARGET_SPEED_MM_S = 6.0      # real-world speed, held constant across whichever
                              # microstep resolution is selected
 RAMP_TIME_S = 0.3            # accelerate from starting speed to target speed
 
-MIN_POSITION_MM = 0.0        # 0 = the homed (retracted hard stop) position
-MAX_POSITION_MM = 100.0      # moves that would land outside
+MIN_POSITION_MM = -10000.0        # 0 = the homed (retracted hard stop) position
+MAX_POSITION_MM = 10000.0      # moves that would land outside
                              # [MIN_POSITION_MM, MAX_POSITION_MM] are refused
 
 # The STOP ramp. Deliberately much shorter than RAMP_TIME_S -- this is a safety
