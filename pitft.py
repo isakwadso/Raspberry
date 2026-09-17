@@ -177,7 +177,7 @@ def main():
     # --- static background, drawn once ---
     bg = Image.new("RGB", (tft.width, tft.height), (0, 0, 0))
     d = ImageDraw.Draw(bg)
-    d.rectangle((0, 0, tft.width - 1, tft.height - 1), outline=(0,255,0))
+    d.rectangle((0, 0, tft.width - 1, tft.height - 1), outline=(80, 80, 80))
     d.text((20, 20), "PiTFT check -- press anywhere", font=font, fill="white")
     # Corner ticks to eyeball the calibration against.
     for cx, cy in ((0, 0), (tft.width - 1, 0), (0, tft.height - 1),
@@ -195,9 +195,31 @@ def main():
     last = None
 
     print("Press the corners and check the reported pixels. Ctrl+C to quit.")
+
     try:
         while True:
-            hit = tft.get_touch()
+            now = time.monotonic()
+            if now >= next_redraw:
+                next_redraw = now + 0.5
+                presses += 1
+
+                box = Image.new("RGB", (READOUT_W, READOUT_H), (0, 0, 60))
+                bd = ImageDraw.Draw(box)
+                bd.rectangle((0, 0, READOUT_W - 1, READOUT_H - 1),
+                             outline=(120, 120, 255))
+                bd.text((15, 20), f"tick {presses}", font=font, fill="white")
+
+                t0 = time.monotonic()
+                tft.draw_region(box, readout_x, readout_y)
+                print(f"tick {presses}  partial redraw "
+                      f"{(time.monotonic() - t0) * 1000:.0f}ms")
+
+            time.sleep(0.02)    
+    
+"""
+    try:
+        while True:
+            hit = None #tft.get_touch()
             if hit and hit != last:
                 presses += 1
                 last = hit
@@ -217,6 +239,7 @@ def main():
                 print(f"{hit}  partial redraw {dt * 1000:.0f}ms")
 
             time.sleep(0.02)
+"""
     except KeyboardInterrupt:
         print("\nstopping")
     finally:
