@@ -185,7 +185,6 @@ class PiTFT:
             min(max(int(px), 0), self.width - 1),
             min(max(int(py), 0), self.height - 1),
         )
-        )
 
     def close(self):
         """Leave the panel dark on exit so a half-drawn UI isn't left sitting
