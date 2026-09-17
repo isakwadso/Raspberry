@@ -59,6 +59,7 @@ PUSH_SIGN = +1
 MAX_ENTRY_CHARS = 5
 MICRO = "\u00b5"             # the letter mu, for "ul"
 
+DEBUG_DOT = True        # draw a white marker wherever a press registers
 
 # ---------------------------------------------------------------------------
 # Colours
@@ -332,6 +333,13 @@ class JogUI:
                     # Act on the press edge only: the panel reports continuously
                     # while held, which would otherwise repeat the key.
                     self._touch_down = True
+                    if DEBUG_DOT:
+                        dot = Image.new("RGB", (9, 9), (255, 255, 255))
+                        self.tft.draw_region(
+                            dot,
+                            min(max(hit[0] - 4, 0), self.tft.width - 9),
+                            min(max(hit[1] - 4, 0), self.tft.height - 9))
+                        print(f"touch {hit}")
                     button = self.find_button(*hit)
                     if button is not None:
                         self.tft.draw_region(button.render(pressed=True),
