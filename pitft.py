@@ -78,6 +78,12 @@ MADCTL_VALUE = 0x28
 RAW_X_MIN, RAW_X_MAX = 403, 3696    # left edge, right edge
 RAW_Y_MIN, RAW_Y_MAX = 510, 3615    # BOTTOM edge, TOP edge
 
+# The corner presses used for calibration were physically a little inside the
+# screen edge -- you cannot press pixel 0. Mapping those raw values onto 0 and
+# width-1 stretches the scale, which reads as correct in the centre and drifts
+# outward near the edges. This is how far inside the edge those presses landed.
+CAL_INSET_PX = 15
+
 # Measured pressure on a deliberate press was 51-77. Anything well below that
 # is noise or the tail end of a release.
 TOUCH_PRESSURE_MIN = 20
@@ -170,11 +176,15 @@ class PiTFT:
             return self._to_pixels(raw_x, raw_y)
 
     def _to_pixels(self, raw_x, raw_y):
-        px = (raw_x - RAW_X_MIN) / (RAW_X_MAX - RAW_X_MIN) * self.width
-        py = (RAW_Y_MAX - raw_y) / (RAW_Y_MAX - RAW_Y_MIN) * self.height  # inverted
+        d = CAL_INSET_PX
+        span_x = self.width - 1 - 2 * d
+        span_y = self.height - 1 - 2 * d
+        px = d + (raw_x - RAW_X_MIN) / (RAW_X_MAX - RAW_X_MIN) * span_x
+        py = d + (RAW_Y_MAX - raw_y) / (RAW_Y_MAX - RAW_Y_MIN) * span_y  # inverted
         return (
             min(max(int(px), 0), self.width - 1),
             min(max(int(py), 0), self.height - 1),
+        )
         )
 
     def close(self):
