@@ -1,34 +1,30 @@
 #!/usr/bin/env python3
 """
-Touchscreen syringe-dispenser interface.
+Touchscreen syringe-dispenser interface, two screens.
 
-    Keypad 0-9 with a "00" key and backspace, a readout showing the entered
-    volume in microlitres and its equivalent travel in mm, and three action
-    buttons:
+    SETUP      manual control for rigging up: keypad, PUSH, PULL, STOP.
+               Same as before.
 
-        PUSH   dispense the entered volume (extends the plunger)
-        PULL   draw up the entered volume (retracts the plunger)
-        STOP   while moving -> ramped stop, position stays known
-               while idle   -> clears the entered value
+    OPERATION  routine use: keypad and a single INJECT button that runs the
+               full cycle -- open target valve, push, close target, open
+               refill, pull, close refill.
 
-    When the position is not trusted (at startup, or after a stall), PULL
-    becomes HOME and PUSH is refused. Homing IS a retraction, so that mapping
-    stays physically honest.
+    The mode button sits in the top right corner and switches between them.
+
+Pressing SETUP while an injection cycle is running ABORTS the cycle (ramped
+stop, valves closed). That is deliberate: the Operation screen has no STOP
+button by request, and until physical end stops are fitted there needs to be
+some way to interrupt a cycle that was started with a wrong volume. To remove
+it, delete the marked block in handle_key().
 
 Run:
     python3 jog_ui.py
 
-Imports pitft.py and actuator.py unchanged from the same directory.
+Imports pitft.py, actuator.py and valves.py from the same directory.
 
-BEFORE RUNNING, one edit in actuator.py -- the travel limits are removed until
-physical end stops are fitted:
-
+REQUIRES in actuator.py, until physical end stops are fitted:
     MIN_POSITION_MM = -1000000.0
     MAX_POSITION_MM =  1000000.0
-
-Nothing then prevents driving into either end stop. The stall watchdog in
-poll() notices the overrun and invalidates the position, but only after the
-actuator has been pushed against a hard stop. Keep an eye on it.
 """
 
 import time
@@ -36,7 +32,9 @@ import time
 from PIL import Image, ImageDraw, ImageFont
 
 from pitft import PiTFT
-from actuator import Actuator, IDLE, MOVING, HOMING, STOPPING, ERROR, STALLED
+from actuator import Actuator, IDLE, STOPPING, ERROR
+import valves as valve_mod
+from valves import Valves, TARGET, REFILL
 
 
 # ===========================================================================
@@ -45,21 +43,21 @@ from actuator import Actuator, IDLE, MOVING, HOMING, STOPPING, ERROR, STALLED
 SYRINGE_BORE_MM = 5.0        # internal diameter of the syringe barrel
 # ===========================================================================
 
-# Travel per microlitre. A 5mm bore gives 19.63mm^2 of cross-section, so 1ul
-# (1mm^3) is about 0.051mm of travel and the full 100mm stroke is roughly
-# 1960ul. Whole microlitres therefore give ample resolution without needing a
-# decimal point -- which is why the keypad has "00" where the "." used to be.
 _BORE_AREA_MM2 = 3.141592653589793 * (SYRINGE_BORE_MM / 2.0) ** 2
 MM_PER_UL = 1.0 / _BORE_AREA_MM2
 
 # PUSH extends the actuator, away from the retracted home position.
-# Flip this to -1 if your mechanics are the other way round.
 PUSH_SIGN = +1
 
 MAX_ENTRY_CHARS = 5
-MICRO = "\u00b5"             # the letter mu, for "ul"
+MICRO = "\u00b5"
 
-DEBUG_DOT = True        # draw a white marker wherever a press registers
+MODE_SETUP = "setup"
+MODE_OPERATION = "operation"
+
+# Set False to remove the cycle-abort behaviour described above.
+SETUP_BUTTON_ABORTS_CYCLE = True
+
 
 # ---------------------------------------------------------------------------
 # Colours
@@ -79,13 +77,15 @@ HOME_FILL   = (110, 80, 15)
 HOME_EDGE   = (230, 180, 60)
 STOP_FILL   = (140, 25, 25)
 STOP_EDGE   = (255, 90, 90)
+INJECT_FILL = (25, 95, 95)
+INJECT_EDGE = (70, 215, 215)
+MODE_FILL   = (50, 40, 70)
+MODE_EDGE   = (150, 130, 200)
 DISABLED    = (45, 45, 55)
 ACCENT      = (120, 120, 255)
 
 
 def load_font(size, bold=False):
-    """PIL's default font is tiny and unreadable at arm's length, and lacks the
-    mu glyph. Fall back to it only if DejaVu is missing."""
     name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
     try:
         return ImageFont.truetype(f"/usr/share/fonts/truetype/dejavu/{name}", size)
@@ -116,29 +116,156 @@ class Button:
         return img
 
 
+# ---------------------------------------------------------------------------
+# The injection cycle
+# ---------------------------------------------------------------------------
+
+class InjectCycle:
+    """Runs the six-step inject sequence without blocking.
+
+    Like Actuator, nothing here waits: start() kicks it off and poll() advances
+    it one step at a time from the main loop, so the display stays live and the
+    touch panel stays responsive throughout.
+
+    Steps:
+        1. open valve to target container
+        2. push the entered volume forward
+        3. close target valve
+        4. open valve to refill container
+        5. pull the same volume back
+        6. close refill valve
+    """
+
+    IDLE = "idle"
+    OPEN_TARGET = "open target"
+    PUSH = "pushing"
+    CLOSE_TARGET = "close target"
+    OPEN_REFILL = "open refill"
+    PULL = "drawing up"
+    CLOSE_REFILL = "close refill"
+    DONE = "done"
+    FAILED = "failed"
+
+    def __init__(self, act, valves):
+        self.act = act
+        self.valves = valves
+        self.state = self.IDLE
+        self.message = ""
+        self._deadline = 0.0
+        self._volume_ul = 0
+
+    @property
+    def running(self):
+        return self.state not in (self.IDLE, self.DONE, self.FAILED)
+
+    def start(self, volume_ul):
+        if self.running:
+            return False, "cycle already running"
+        if not self.act.homed:
+            return False, "home first"
+        if volume_ul <= 0:
+            return False, "volume must be > 0"
+
+        self._volume_ul = volume_ul
+        self.valves.open(TARGET)
+        self._deadline = time.monotonic() + valve_mod.VALVE_SETTLE_S
+        self.state = self.OPEN_TARGET
+        self.message = f"cycle: {volume_ul} {MICRO}l"
+        return True, self.message
+
+    def abort(self, reason="aborted"):
+        if not self.running:
+            return
+        self.act.stop()
+        self.valves.close_all()
+        self.state = self.FAILED
+        self.message = reason
+
+    def poll(self):
+        """Advance the cycle. Call every loop iteration. The caller is
+        responsible for calling act.poll() as well."""
+        if not self.running:
+            return self.state
+
+        now = time.monotonic()
+        mm = self._volume_ul * MM_PER_UL
+
+        # Any actuator fault stops the cycle where it stands, with the valves
+        # closed. Leaving a valve open after a failed move would leave the
+        # target line connected to a syringe in an unknown state.
+        if self.act.state in (ERROR,) or self.act.state == "stalled":
+            self.abort(f"actuator: {self.act.message}")
+            return self.state
+
+        if self.state == self.OPEN_TARGET:
+            if now >= self._deadline:
+                ok, msg = self.act.start_move_relative(PUSH_SIGN * mm)
+                if not ok:
+                    self.abort(f"push refused: {msg}")
+                else:
+                    self.state = self.PUSH
+
+        elif self.state == self.PUSH:
+            if not self.act.busy:
+                self.valves.close(TARGET)
+                self._deadline = now + valve_mod.VALVE_SETTLE_S
+                self.state = self.CLOSE_TARGET
+
+        elif self.state == self.CLOSE_TARGET:
+            if now >= self._deadline:
+                self.valves.open(REFILL)
+                self._deadline = now + valve_mod.VALVE_SETTLE_S
+                self.state = self.OPEN_REFILL
+
+        elif self.state == self.OPEN_REFILL:
+            if now >= self._deadline:
+                ok, msg = self.act.start_move_relative(-PUSH_SIGN * mm)
+                if not ok:
+                    self.abort(f"pull refused: {msg}")
+                else:
+                    self.state = self.PULL
+
+        elif self.state == self.PULL:
+            if not self.act.busy:
+                self.valves.close(REFILL)
+                self._deadline = now + valve_mod.VALVE_SETTLE_S
+                self.state = self.CLOSE_REFILL
+
+        elif self.state == self.CLOSE_REFILL:
+            if now >= self._deadline:
+                self.state = self.DONE
+                self.message = f"done: {self._volume_ul} {MICRO}l"
+
+        return self.state
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+
 class JogUI:
-    # Readout regions, kept small on purpose: a partial redraw costs time in
-    # proportion to its AREA, and the loop must stay responsive so STOP is
-    # always reachable. A full-screen redraw is ~180ms, far too long to ignore
-    # a safety button for.
-    ENTRY_X, ENTRY_Y, ENTRY_W, ENTRY_H = 8, 6, 300, 40
+    ENTRY_X, ENTRY_Y, ENTRY_W, ENTRY_H = 8, 6, 290, 40
     STATUS_X, STATUS_Y, STATUS_W, STATUS_H = 8, 50, 464, 30
+    BODY_TOP = 84
 
     def __init__(self):
         self.tft = PiTFT()
         self.act = Actuator(microstep_divisor=16)
+        self.valves = Valves()
+        self.cycle = InjectCycle(self.act, self.valves)
 
         self.font_key = load_font(26, bold=True)
         self.font_big = load_font(30, bold=True)
         self.font_act = load_font(24, bold=True)
+        self.font_mode = load_font(15, bold=True)
         self.font_mid = load_font(18)
         self.font_small = load_font(15)
 
+        self.mode = MODE_SETUP
         self.entry = ""
         self.status = "starting"
-        self.buttons = []
-        self._build_buttons()
 
+        self._build_buttons()
         self._last_entry_drawn = None
         self._last_status_drawn = None
         self._last_homed = None
@@ -147,7 +274,7 @@ class JogUI:
     # -- layout -------------------------------------------------------------
 
     def _build_buttons(self):
-        # Keypad: 3 columns x 4 rows on the left.
+        # Shared keypad, present on both screens.
         keys = [["7", "8", "9"],
                 ["4", "5", "6"],
                 ["1", "2", "3"],
@@ -155,36 +282,59 @@ class JogUI:
         x0, y0 = 6, 88
         cw, ch, gap = 80, 55, 4
 
+        self.keypad = []
         for row, labels in enumerate(keys):
             for col, label in enumerate(labels):
-                self.buttons.append(Button(
+                self.keypad.append(Button(
                     label, label,
                     x0 + col * (cw + gap), y0 + row * (ch + gap),
                     cw, ch, KEY_FILL, KEY_EDGE, font=self.font_key))
 
-        # Action column on the right. STOP is the largest and sits at the
-        # bottom edge, where a thumb lands naturally and where it cannot be
-        # confused with the two motion buttons above it.
+        # Mode switch, top right corner, present on both screens.
+        self.mode_button = Button("MODE", "OPERATION", 386, 6, 88, 36,
+                                  MODE_FILL, MODE_EDGE, font=self.font_mode)
+
         bx, bw = 266, 208
+        # Setup screen actions.
         self.push_button = Button("PUSH", "PUSH", bx, 88, bw, 66,
                                   PUSH_FILL, PUSH_EDGE, font=self.font_act)
         self.pull_button = Button("PULL", "PULL", bx, 160, bw, 66,
                                   PULL_FILL, PULL_EDGE, font=self.font_act)
         self.stop_button = Button("STOP", "STOP", bx, 232, bw, 82,
                                   STOP_FILL, STOP_EDGE, font=self.font_big)
-        self.buttons += [self.push_button, self.pull_button, self.stop_button]
+
+        # Operation screen action: one tall button.
+        self.inject_button = Button("INJECT", "INJECT", bx, 88, bw, 226,
+                                    INJECT_FILL, INJECT_EDGE, font=self.font_big)
+
+    def active_buttons(self):
+        common = self.keypad + [self.mode_button]
+        if self.mode == MODE_SETUP:
+            return common + [self.push_button, self.pull_button, self.stop_button]
+        return common + [self.inject_button]
 
     # -- rendering ----------------------------------------------------------
 
-    def draw_static(self):
-        """Everything that never changes, pushed once as a single full frame."""
+    def draw_screen(self):
+        """Full repaint. Only happens at startup and on a mode switch -- never
+        inside the running loop, where 180ms of blindness would matter."""
         bg = Image.new("RGB", (self.tft.width, self.tft.height), BG)
         d = ImageDraw.Draw(bg)
-        d.rectangle((0, 0, self.tft.width - 1, 82), fill=PANEL, outline=ACCENT)
+        d.rectangle((0, 0, self.tft.width - 1, self.BODY_TOP - 2),
+                    fill=PANEL, outline=ACCENT)
         self.tft.draw_full(bg)
 
-        for b in self.buttons:
+        self.mode_button.label = ("OPERATION" if self.mode == MODE_SETUP
+                                  else "SETUP")
+        for b in self.active_buttons():
             self.tft.draw_region(b.render(), b.x, b.y)
+
+        self._last_entry_drawn = None
+        self._last_status_drawn = None
+        self._last_homed = None
+        self.draw_entry(force=True)
+        self.draw_status(force=True)
+        self.refresh_action_buttons(force=True)
 
     def _entry_text(self):
         if not self.entry:
@@ -202,7 +352,7 @@ class JogUI:
         img = Image.new("RGB", (self.ENTRY_W, self.ENTRY_H), PANEL)
         d = ImageDraw.Draw(img)
         d.text((4, 4), value, font=self.font_big, fill=TEXT)
-        d.text((155, 12), converted, font=self.font_mid, fill=DIM)
+        d.text((150, 12), converted, font=self.font_mid, fill=DIM)
         self.tft.draw_region(img, self.ENTRY_X, self.ENTRY_Y)
 
     def draw_status(self, force=False):
@@ -223,24 +373,34 @@ class JogUI:
         self.tft.draw_region(img, self.STATUS_X, self.STATUS_Y)
 
     def refresh_action_buttons(self, force=False):
-        """PULL becomes HOME whenever the position is not trusted, so a stall
-        never leaves the interface with no way forward. PUSH is greyed out in
-        that state -- driving forward from an unknown position is exactly how
-        you crash into the far end stop."""
+        """PULL becomes HOME when the position is not trusted; PUSH and INJECT
+        grey out, since driving forward from an unknown position is how you
+        crash into the far end stop."""
         if self.act.homed == self._last_homed and not force:
             return
         self._last_homed = self.act.homed
 
-        if self.act.homed:
-            self.pull_button.label = "PULL"
-            self.pull_button.fill, self.pull_button.edge = PULL_FILL, PULL_EDGE
-            self.push_button.fill, self.push_button.edge = PUSH_FILL, PUSH_EDGE
+        if self.mode == MODE_SETUP:
+            if self.act.homed:
+                self.pull_button.label = "PULL"
+                self.pull_button.fill, self.pull_button.edge = PULL_FILL, PULL_EDGE
+                self.push_button.fill, self.push_button.edge = PUSH_FILL, PUSH_EDGE
+            else:
+                self.pull_button.label = "HOME"
+                self.pull_button.fill, self.pull_button.edge = HOME_FILL, HOME_EDGE
+                self.push_button.fill, self.push_button.edge = DISABLED, KEY_EDGE
+            targets = (self.push_button, self.pull_button)
         else:
-            self.pull_button.label = "HOME"
-            self.pull_button.fill, self.pull_button.edge = HOME_FILL, HOME_EDGE
-            self.push_button.fill, self.push_button.edge = DISABLED, KEY_EDGE
+            if self.act.homed:
+                self.inject_button.label = "INJECT"
+                self.inject_button.fill = INJECT_FILL
+                self.inject_button.edge = INJECT_EDGE
+            else:
+                self.inject_button.label = "HOME"
+                self.inject_button.fill, self.inject_button.edge = HOME_FILL, HOME_EDGE
+            targets = (self.inject_button,)
 
-        for b in (self.push_button, self.pull_button):
+        for b in targets:
             self.tft.draw_region(b.render(), b.x, b.y)
 
     # -- input --------------------------------------------------------------
@@ -257,6 +417,26 @@ class JogUI:
         self.status = msg if ok else f"refused: {msg}"
 
     def handle_key(self, key):
+        if key == "MODE":
+            # ---- cycle abort on leaving Operation ----
+            # Delete this block to make the mode button purely a screen switch.
+            if SETUP_BUTTON_ABORTS_CYCLE and self.cycle.running:
+                self.cycle.abort("aborted by mode switch")
+                self.status = self.cycle.message
+            # ------------------------------------------
+            if self.cycle.running:
+                return
+            self.mode = (MODE_OPERATION if self.mode == MODE_SETUP
+                         else MODE_SETUP)
+            self.draw_screen()
+            return
+
+        if self.mode == MODE_SETUP:
+            self._handle_setup_key(key)
+        else:
+            self._handle_operation_key(key)
+
+    def _handle_setup_key(self, key):
         if key == "STOP":
             if self.act.busy:
                 self.act.stop()
@@ -267,7 +447,6 @@ class JogUI:
             return
 
         if self.act.busy:
-            # Everything except STOP is inert while the actuator is moving.
             return
 
         if key == "PUSH":
@@ -285,17 +464,37 @@ class JogUI:
             self._start_move(-PUSH_SIGN)
             return
 
-        # keypad
+        self._handle_keypad(key)
+
+    def _handle_operation_key(self, key):
+        if self.cycle.running or self.act.busy:
+            return
+
+        if key == "INJECT":
+            if not self.act.homed:
+                self.act.start_home()
+                self.status = "homing"
+                return
+            if not self.entry:
+                self.status = "no volume set"
+                return
+            ok, msg = self.cycle.start(int(self.entry))
+            self.status = msg if ok else f"refused: {msg}"
+            return
+
+        self._handle_keypad(key)
+
+    def _handle_keypad(self, key):
         if key == "<":
             self.entry = self.entry[:-1]
         elif key == "00":
             if self.entry and self.entry != "0":
                 self.entry = (self.entry + "00")[:MAX_ENTRY_CHARS]
-        elif len(self.entry) < MAX_ENTRY_CHARS:
+        elif key in "0123456789" and len(self.entry) < MAX_ENTRY_CHARS:
             self.entry = key if self.entry in ("", "0") else self.entry + key
 
     def find_button(self, px, py):
-        for b in self.buttons:
+        for b in self.active_buttons():
             if b.contains(px, py):
                 return b
         return None
@@ -303,10 +502,7 @@ class JogUI:
     # -- main loop ----------------------------------------------------------
 
     def run(self):
-        self.draw_static()
-        self.draw_entry(force=True)
-        self.draw_status(force=True)
-        self.refresh_action_buttons(force=True)
+        self.draw_screen()
 
         if self.act.state == ERROR:
             self.status = self.act.message
@@ -317,33 +513,42 @@ class JogUI:
         self.act.start_home()
         self.status = "homing"
         last_state = None
+        last_cycle_state = None
 
         try:
             while True:
-                # Poll the actuator EVERY iteration, in every state -- it feeds
-                # the Tic's command-timeout watchdog as well as advancing moves.
+                # Both pollers, every iteration. act.poll() also feeds the
+                # Tic's command-timeout watchdog, so it is never optional.
                 state = self.act.poll()
+                cycle_state = self.cycle.poll()
 
-                if state != last_state:
+                if cycle_state != last_cycle_state:
+                    last_cycle_state = cycle_state
+                    if self.cycle.running:
+                        self.status = cycle_state
+                    elif cycle_state in (InjectCycle.DONE, InjectCycle.FAILED):
+                        self.status = self.cycle.message
+                elif state != last_state:
                     last_state = state
-                    self.status = self.act.message
+                    if not self.cycle.running:
+                        self.status = self.act.message
 
                 hit = self.tft.get_touch()
                 if hit is not None and not self._touch_down:
-                    # Act on the press edge only: the panel reports continuously
-                    # while held, which would otherwise repeat the key.
                     self._touch_down = True
-
                     button = self.find_button(*hit)
                     if button is not None:
                         self.tft.draw_region(button.render(pressed=True),
                                              button.x, button.y)
                         self.handle_key(button.key)
-                        # Poll again before spending time repainting, so a STOP
-                        # is acted on at once rather than after the redraw.
                         self.act.poll()
-                        self.tft.draw_region(button.render(),
-                                             button.x, button.y)
+                        # handle_key may have repainted the whole screen on a
+                        # mode switch, in which case this button no longer
+                        # exists on screen -- only unpress it if it is still
+                        # part of the current screen.
+                        if button in self.active_buttons():
+                            self.tft.draw_region(button.render(),
+                                                 button.x, button.y)
                 elif hit is None:
                     self._touch_down = False
 
@@ -355,19 +560,22 @@ class JogUI:
 
         except KeyboardInterrupt:
             print("\nstopping")
+            self.cycle.abort("interrupted")
             self.act.stop()
             while self.act.state == STOPPING:
                 self.act.poll()
                 time.sleep(0.02)
         finally:
+            self.valves.close_all()
             self.act.close()
             self.tft.close()
 
 
 def main():
     print(f"syringe bore {SYRINGE_BORE_MM}mm -> "
-          f"{MM_PER_UL:.4f} mm travel per {MICRO}l "
+          f"{MM_PER_UL:.4f} mm per {MICRO}l "
           f"({1.0 / MM_PER_UL:.1f} {MICRO}l per mm)")
+    print("valves are PLACEHOLDERS -- see valves.py")
     JogUI().run()
 
 
