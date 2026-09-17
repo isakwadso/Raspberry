@@ -2,27 +2,33 @@
 """
 Touchscreen syringe-dispenser interface.
 
-    Keypad 0-9 with a decimal point and backspace, a readout showing the
-    entered volume and its equivalent travel in mm, a MOVE button and a STOP
-    button.
+    Keypad 0-9 with a "00" key and backspace, a readout showing the entered
+    volume in microlitres and its equivalent travel in mm, and three action
+    buttons:
 
-    STOP while moving   -> ramped stop, position stays known
-    STOP while idle     -> clears the entered value
+        PUSH   dispense the entered volume (extends the plunger)
+        PULL   draw up the entered volume (retracts the plunger)
+        STOP   while moving -> ramped stop, position stays known
+               while idle   -> clears the entered value
+
+    When the position is not trusted (at startup, or after a stall), PULL
+    becomes HOME and PUSH is refused. Homing IS a retraction, so that mapping
+    stays physically honest.
 
 Run:
     python3 jog_ui.py
 
 Imports pitft.py and actuator.py unchanged from the same directory.
 
-BEFORE RUNNING, one edit in actuator.py -- the travel limits are being removed
-until physical end stops are fitted:
+BEFORE RUNNING, one edit in actuator.py -- the travel limits are removed until
+physical end stops are fitted:
 
     MIN_POSITION_MM = -1000000.0
     MAX_POSITION_MM =  1000000.0
 
 Nothing then prevents driving into either end stop. The stall watchdog in
-poll() will notice the overrun and invalidate the position, but the actuator
-will have been pushed against a hard stop first. Keep an eye on it.
+poll() notices the overrun and invalidates the position, but only after the
+actuator has been pushed against a hard stop. Keep an eye on it.
 """
 
 import time
@@ -30,7 +36,6 @@ import time
 from PIL import Image, ImageDraw, ImageFont
 
 from pitft import PiTFT
-import actuator as act_mod
 from actuator import Actuator, IDLE, MOVING, HOMING, STOPPING, ERROR, STALLED
 
 
@@ -40,17 +45,19 @@ from actuator import Actuator, IDLE, MOVING, HOMING, STOPPING, ERROR, STALLED
 SYRINGE_BORE_MM = 5.0        # internal diameter of the syringe barrel
 # ===========================================================================
 
-# Travel needed per millilitre. A 5mm bore gives 19.63mm^2 of cross-section,
-# so 1ml (1000mm^3) is about 51mm of travel -- i.e. a 100mm actuator covers
-# under 2ml. That is why the keypad has a decimal point.
+# Travel per microlitre. A 5mm bore gives 19.63mm^2 of cross-section, so 1ul
+# (1mm^3) is about 0.051mm of travel and the full 100mm stroke is roughly
+# 1960ul. Whole microlitres therefore give ample resolution without needing a
+# decimal point -- which is why the keypad has "00" where the "." used to be.
 _BORE_AREA_MM2 = 3.141592653589793 * (SYRINGE_BORE_MM / 2.0) ** 2
-MM_PER_ML = 1000.0 / _BORE_AREA_MM2
+MM_PER_UL = 1.0 / _BORE_AREA_MM2
 
-# Dispensing extends the actuator, i.e. the positive direction away from the
-# retracted home position. Flip this if your mechanics are the other way round.
-DISPENSE_SIGN = +1
+# PUSH extends the actuator, away from the retracted home position.
+# Flip this to -1 if your mechanics are the other way round.
+PUSH_SIGN = +1
 
-MAX_ENTRY_CHARS = 6
+MAX_ENTRY_CHARS = 5
+MICRO = "\u00b5"             # the letter mu, for "ul"
 
 
 # ---------------------------------------------------------------------------
@@ -63,18 +70,21 @@ KEY_EDGE    = (90, 90, 120)
 KEY_PRESSED = (110, 110, 150)
 TEXT        = (255, 255, 255)
 DIM         = (150, 150, 165)
-MOVE_FILL   = (20, 110, 45)
-MOVE_EDGE   = (60, 210, 100)
+PUSH_FILL   = (20, 110, 45)
+PUSH_EDGE   = (60, 210, 100)
+PULL_FILL   = (25, 70, 125)
+PULL_EDGE   = (80, 160, 255)
 HOME_FILL   = (110, 80, 15)
 HOME_EDGE   = (230, 180, 60)
 STOP_FILL   = (140, 25, 25)
 STOP_EDGE   = (255, 90, 90)
+DISABLED    = (45, 45, 55)
 ACCENT      = (120, 120, 255)
 
 
 def load_font(size, bold=False):
-    """PIL's default font is tiny and unreadable at arm's length. Fall back to
-    it only if DejaVu is missing."""
+    """PIL's default font is tiny and unreadable at arm's length, and lacks the
+    mu glyph. Fall back to it only if DejaVu is missing."""
     name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
     try:
         return ImageFont.truetype(f"/usr/share/fonts/truetype/dejavu/{name}", size)
@@ -83,13 +93,11 @@ def load_font(size, bold=False):
 
 
 class Button:
-    def __init__(self, key, label, x, y, w, h, fill, edge, text_colour=TEXT,
-                 font=None):
+    def __init__(self, key, label, x, y, w, h, fill, edge, font=None):
         self.key = key
         self.label = label
         self.x, self.y, self.w, self.h = x, y, w, h
         self.fill, self.edge = fill, edge
-        self.text_colour = text_colour
         self.font = font
 
     def contains(self, px, py):
@@ -103,15 +111,15 @@ class Button:
         bbox = d.textbbox((0, 0), self.label, font=self.font)
         d.text(((self.w - (bbox[2] - bbox[0])) / 2 - bbox[0],
                 (self.h - (bbox[3] - bbox[1])) / 2 - bbox[1]),
-               self.label, font=self.font, fill=self.text_colour)
+               self.label, font=self.font, fill=TEXT)
         return img
 
 
 class JogUI:
     # Readout regions, kept small on purpose: a partial redraw costs time in
     # proportion to its AREA, and the loop must stay responsive so STOP is
-    # always reachable. A full-screen redraw is ~180ms, which is far too long
-    # to ignore a safety button for.
+    # always reachable. A full-screen redraw is ~180ms, far too long to ignore
+    # a safety button for.
     ENTRY_X, ENTRY_Y, ENTRY_W, ENTRY_H = 8, 6, 300, 40
     STATUS_X, STATUS_Y, STATUS_W, STATUS_H = 8, 50, 464, 30
 
@@ -121,6 +129,7 @@ class JogUI:
 
         self.font_key = load_font(26, bold=True)
         self.font_big = load_font(30, bold=True)
+        self.font_act = load_font(24, bold=True)
         self.font_mid = load_font(18)
         self.font_small = load_font(15)
 
@@ -131,6 +140,7 @@ class JogUI:
 
         self._last_entry_drawn = None
         self._last_status_drawn = None
+        self._last_homed = None
         self._touch_down = False
 
     # -- layout -------------------------------------------------------------
@@ -140,7 +150,7 @@ class JogUI:
         keys = [["7", "8", "9"],
                 ["4", "5", "6"],
                 ["1", "2", "3"],
-                [".", "0", "<"]]
+                ["00", "0", "<"]]
         x0, y0 = 6, 88
         cw, ch, gap = 80, 55, 4
 
@@ -151,14 +161,17 @@ class JogUI:
                     x0 + col * (cw + gap), y0 + row * (ch + gap),
                     cw, ch, KEY_FILL, KEY_EDGE, font=self.font_key))
 
-        # MOVE and STOP on the right. STOP is the taller of the two and sits
-        # at the bottom edge where a thumb naturally lands.
-        self.move_button = Button("MOVE", "MOVE", 266, 88, 208, 100,
-                                  MOVE_FILL, MOVE_EDGE, font=self.font_big)
-        self.stop_button = Button("STOP", "STOP", 266, 196, 208, 118,
+        # Action column on the right. STOP is the largest and sits at the
+        # bottom edge, where a thumb lands naturally and where it cannot be
+        # confused with the two motion buttons above it.
+        bx, bw = 266, 208
+        self.push_button = Button("PUSH", "PUSH", bx, 88, bw, 66,
+                                  PUSH_FILL, PUSH_EDGE, font=self.font_act)
+        self.pull_button = Button("PULL", "PULL", bx, 160, bw, 66,
+                                  PULL_FILL, PULL_EDGE, font=self.font_act)
+        self.stop_button = Button("STOP", "STOP", bx, 232, bw, 82,
                                   STOP_FILL, STOP_EDGE, font=self.font_big)
-        self.buttons.append(self.move_button)
-        self.buttons.append(self.stop_button)
+        self.buttons += [self.push_button, self.pull_button, self.stop_button]
 
     # -- rendering ----------------------------------------------------------
 
@@ -174,12 +187,9 @@ class JogUI:
 
     def _entry_text(self):
         if not self.entry:
-            return "-- ml", ""
-        try:
-            ml = float(self.entry)
-        except ValueError:
-            return self.entry + " ml", "invalid"
-        return f"{self.entry} ml", f"= {ml * MM_PER_ML:.1f} mm"
+            return f"--- {MICRO}l", ""
+        ul = int(self.entry)
+        return f"{ul} {MICRO}l", f"= {ul * MM_PER_UL:.2f} mm"
 
     def draw_entry(self, force=False):
         value, converted = self._entry_text()
@@ -191,13 +201,13 @@ class JogUI:
         img = Image.new("RGB", (self.ENTRY_W, self.ENTRY_H), PANEL)
         d = ImageDraw.Draw(img)
         d.text((4, 4), value, font=self.font_big, fill=TEXT)
-        d.text((150, 12), converted, font=self.font_mid, fill=DIM)
+        d.text((155, 12), converted, font=self.font_mid, fill=DIM)
         self.tft.draw_region(img, self.ENTRY_X, self.ENTRY_Y)
 
     def draw_status(self, force=False):
         pos = self.act.position_mm
         if self.act.homed:
-            pos_text = f"pos {pos:7.2f} mm / {pos / MM_PER_ML:5.3f} ml"
+            pos_text = f"pos {pos:7.2f} mm / {pos / MM_PER_UL:6.0f} {MICRO}l"
         else:
             pos_text = "position unknown"
         key = (self.status, pos_text)
@@ -211,19 +221,39 @@ class JogUI:
         d.text((250, 4), self.status, font=self.font_small, fill=DIM)
         self.tft.draw_region(img, self.STATUS_X, self.STATUS_Y)
 
-    def refresh_move_button(self):
-        """MOVE becomes HOME whenever the position is not trusted, so a stall
-        never leaves the interface with no way forward."""
+    def refresh_action_buttons(self, force=False):
+        """PULL becomes HOME whenever the position is not trusted, so a stall
+        never leaves the interface with no way forward. PUSH is greyed out in
+        that state -- driving forward from an unknown position is exactly how
+        you crash into the far end stop."""
+        if self.act.homed == self._last_homed and not force:
+            return
+        self._last_homed = self.act.homed
+
         if self.act.homed:
-            self.move_button.label = "MOVE"
-            self.move_button.fill, self.move_button.edge = MOVE_FILL, MOVE_EDGE
+            self.pull_button.label = "PULL"
+            self.pull_button.fill, self.pull_button.edge = PULL_FILL, PULL_EDGE
+            self.push_button.fill, self.push_button.edge = PUSH_FILL, PUSH_EDGE
         else:
-            self.move_button.label = "HOME"
-            self.move_button.fill, self.move_button.edge = HOME_FILL, HOME_EDGE
-        self.tft.draw_region(self.move_button.render(),
-                             self.move_button.x, self.move_button.y)
+            self.pull_button.label = "HOME"
+            self.pull_button.fill, self.pull_button.edge = HOME_FILL, HOME_EDGE
+            self.push_button.fill, self.push_button.edge = DISABLED, KEY_EDGE
+
+        for b in (self.push_button, self.pull_button):
+            self.tft.draw_region(b.render(), b.x, b.y)
 
     # -- input --------------------------------------------------------------
+
+    def _start_move(self, sign):
+        if not self.entry:
+            self.status = "no volume set"
+            return
+        ul = int(self.entry)
+        if ul <= 0:
+            self.status = "volume must be > 0"
+            return
+        ok, msg = self.act.start_move_relative(sign * ul * MM_PER_UL)
+        self.status = msg if ok else f"refused: {msg}"
 
     def handle_key(self, key):
         if key == "STOP":
@@ -235,42 +265,33 @@ class JogUI:
                 self.status = "cleared"
             return
 
-        if key == "MOVE":
-            if self.act.busy:
+        if self.act.busy:
+            # Everything except STOP is inert while the actuator is moving.
+            return
+
+        if key == "PUSH":
+            if not self.act.homed:
+                self.status = "home first"
                 return
+            self._start_move(PUSH_SIGN)
+            return
+
+        if key == "PULL":
             if not self.act.homed:
                 self.act.start_home()
                 self.status = "homing"
                 return
-            if not self.entry:
-                self.status = "no volume set"
-                return
-            try:
-                ml = float(self.entry)
-            except ValueError:
-                self.status = "invalid entry"
-                return
-            if ml <= 0:
-                self.status = "volume must be > 0"
-                return
-            delta_mm = DISPENSE_SIGN * ml * MM_PER_ML
-            ok, msg = self.act.start_move_relative(delta_mm)
-            self.status = msg if ok else f"refused: {msg}"
+            self._start_move(-PUSH_SIGN)
             return
 
         # keypad
-        if self.act.busy:
-            return
         if key == "<":
             self.entry = self.entry[:-1]
-        elif key == ".":
-            if "." not in self.entry and len(self.entry) < MAX_ENTRY_CHARS:
-                self.entry = (self.entry or "0") + "."
+        elif key == "00":
+            if self.entry and self.entry != "0":
+                self.entry = (self.entry + "00")[:MAX_ENTRY_CHARS]
         elif len(self.entry) < MAX_ENTRY_CHARS:
-            if self.entry == "0":
-                self.entry = key
-            else:
-                self.entry += key
+            self.entry = key if self.entry in ("", "0") else self.entry + key
 
     def find_button(self, px, py):
         for b in self.buttons:
@@ -284,6 +305,7 @@ class JogUI:
         self.draw_static()
         self.draw_entry(force=True)
         self.draw_status(force=True)
+        self.refresh_action_buttons(force=True)
 
         if self.act.state == ERROR:
             self.status = self.act.message
@@ -304,7 +326,6 @@ class JogUI:
                 if state != last_state:
                     last_state = state
                     self.status = self.act.message
-                    self.refresh_move_button()
 
                 hit = self.tft.get_touch()
                 if hit is not None and not self._touch_down:
@@ -316,14 +337,15 @@ class JogUI:
                         self.tft.draw_region(button.render(pressed=True),
                                              button.x, button.y)
                         self.handle_key(button.key)
-                        # Repaint unpressed. Poll once more first so a STOP is
-                        # acted on before spending time drawing.
+                        # Poll again before spending time repainting, so a STOP
+                        # is acted on at once rather than after the redraw.
                         self.act.poll()
                         self.tft.draw_region(button.render(),
                                              button.x, button.y)
                 elif hit is None:
                     self._touch_down = False
 
+                self.refresh_action_buttons()
                 self.draw_entry()
                 self.draw_status()
 
@@ -341,7 +363,9 @@ class JogUI:
 
 
 def main():
-    print(f"syringe bore {SYRINGE_BORE_MM}mm -> {MM_PER_ML:.2f} mm travel per ml")
+    print(f"syringe bore {SYRINGE_BORE_MM}mm -> "
+          f"{MM_PER_UL:.4f} mm travel per {MICRO}l "
+          f"({1.0 / MM_PER_UL:.1f} {MICRO}l per mm)")
     JogUI().run()
 
 
