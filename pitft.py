@@ -159,7 +159,10 @@ READOUT_W, READOUT_H = 300, 90
 def main():
     tft = PiTFT()
     print(f"display reports {tft.width}x{tft.height}")
-    print("touch chip id:", hex(tft.touch.get_version()), "(expect 0x811)")
+    version = tft.touch.get_version
+    if callable(version):
+        version = version()
+    print("touch chip id:", hex(version), "(expect 0x811)")
 
     font = ImageFont.load_default()
 
