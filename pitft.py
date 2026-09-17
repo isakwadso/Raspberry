@@ -161,10 +161,10 @@ def main():
     tft = PiTFT()
     print(f"display reports {tft.width}x{tft.height}")
 
-    #version = tft.touch.get_version
-    #if callable(version):
-    #    version = version()
-    #print("touch chip id:", hex(version), "(expect 0x811)")
+    version = tft.touch.get_version
+    if callable(version):
+        version = version()
+    print("touch chip id:", hex(version), "(expect 0x811)")
     
     font = ImageFont.load_default()
 
@@ -191,7 +191,7 @@ def main():
     print("Press the corners and check the reported pixels. Ctrl+C to quit.")
     try:
         while True:
-            hit = None #tft.get_touch()
+            hit = tft.get_touch()
             if hit and hit != last:
                 presses += 1
                 last = hit
