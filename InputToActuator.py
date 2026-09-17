@@ -225,11 +225,13 @@ def jog_loop(tic, microstep_divisor):
             continue
 
         target_mm = position_mm + delta_mm
+        """
         if not (MIN_POSITION_MM <= target_mm <= MAX_POSITION_MM):
             print(f"  Skipped: {target_mm:.2f}mm would be outside the allowed "
                   f"{MIN_POSITION_MM:g}-{MAX_POSITION_MM:g}mm range "
                   f"(currently at {position_mm:.2f}mm).")
             continue
+        """
 
         target_steps = int(round(target_mm / mm_per_step))
         print(f"  Moving {delta_mm:+.2f}mm -> {target_mm:.2f}mm ({target_steps} steps)")
