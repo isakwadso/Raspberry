@@ -82,7 +82,7 @@ RAW_Y_MIN, RAW_Y_MAX = 510, 3615    # BOTTOM edge, TOP edge
 # screen edge -- you cannot press pixel 0. Mapping those raw values onto 0 and
 # width-1 stretches the scale, which reads as correct in the centre and drifts
 # outward near the edges. This is how far inside the edge those presses landed.
-CAL_INSET_PX = 15
+CAL_INSET_PX = 25
 
 # Measured pressure on a deliberate press was 51-77. Anything well below that
 # is noise or the tail end of a release.
