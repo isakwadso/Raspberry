@@ -140,22 +140,34 @@ class PiTFT:
     # -- touch --------------------------------------------------------------
 
     def get_touch(self):
-        """Return (x, y) in pixels for the most recent press, or None.
+            """Return (x, y) in pixels for the most recent press, or None.
 
-        The STMPE610 buffers samples, so a single press yields several. We
-        drain the buffer and keep the last valid sample -- draining matters,
-        because a buffer left full makes the next press read as stale
-        coordinates from the previous one.
-        """
-        if not self.touch.touched:
-            return None
+            Draining on RELEASE matters as much as draining on press: the STMPE610
+            keeps buffering through the release, and those trailing samples would
+            otherwise be read at the start of the next press and reported as its
+            coordinates -- which shows up as the previously-pressed button
+            activating instead of the intended one.
+            """
+            if not self.touch.touched:
+                while not self.touch.buffer_empty:
+                    self.touch.touch_point      # discard release stragglers
+                return None
 
-        point = None
-        while not self.touch.buffer_empty:
-            raw_x, raw_y, pressure = self.touch.touch_point
-            if pressure >= TOUCH_PRESSURE_MIN:
-                point = self._to_pixels(raw_x, raw_y)
-        return point
+            samples = []
+            while not self.touch.buffer_empty:
+                raw_x, raw_y, pressure = self.touch.touch_point
+                if pressure >= TOUCH_PRESSURE_MIN:
+                    samples.append((raw_x, raw_y))
+
+            if not samples:
+                return None
+
+            # Median rather than last: resistive panels give unsettled coordinates
+            # as pressure ramps up, and a median discards those outliers without
+            # needing a settling delay.
+            samples.sort()
+            raw_x, raw_y = samples[len(samples) // 2]
+            return self._to_pixels(raw_x, raw_y)
 
     def _to_pixels(self, raw_x, raw_y):
         px = (raw_x - RAW_X_MIN) / (RAW_X_MAX - RAW_X_MIN) * self.width
