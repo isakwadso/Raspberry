@@ -93,7 +93,7 @@ class PiTFT:
         # The touch chip tolerates far less SPI speed than the display; the
         # library sets its own baudrate when it locks the bus, so the two
         # coexist on SPI0 without interfering.
-        self.touch = Adafruit_STMPE610_SPI(spi, digitalio.DigitalInOut(board.CE1))
+        #self.touch = Adafruit_STMPE610_SPI(spi, digitalio.DigitalInOut(board.CE1))
 
     # -- drawing ------------------------------------------------------------
 
@@ -159,11 +159,12 @@ READOUT_W, READOUT_H = 300, 90
 def main():
     tft = PiTFT()
     print(f"display reports {tft.width}x{tft.height}")
-    version = tft.touch.get_version
-    if callable(version):
-        version = version()
-    print("touch chip id:", hex(version), "(expect 0x811)")
 
+    #version = tft.touch.get_version
+    #if callable(version):
+    #    version = version()
+    #print("touch chip id:", hex(version), "(expect 0x811)")
+    
     font = ImageFont.load_default()
 
     # --- static background, drawn once ---
@@ -189,7 +190,7 @@ def main():
     print("Press the corners and check the reported pixels. Ctrl+C to quit.")
     try:
         while True:
-            hit = tft.get_touch()
+            hit = None #tft.get_touch()
             if hit and hit != last:
                 presses += 1
                 last = hit
