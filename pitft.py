@@ -177,7 +177,7 @@ def main():
     # --- static background, drawn once ---
     bg = Image.new("RGB", (tft.width, tft.height), (0, 0, 0))
     d = ImageDraw.Draw(bg)
-    d.rectangle((0, 0, tft.width - 1, tft.height - 1), outline=(80, 80, 80))
+    d.rectangle((0, 0, tft.width - 1, tft.height - 1), outline=(0,255,0))
     d.text((20, 20), "PiTFT check -- press anywhere", font=font, fill="white")
     # Corner ticks to eyeball the calibration against.
     for cx, cy in ((0, 0), (tft.width - 1, 0), (0, tft.height - 1),
