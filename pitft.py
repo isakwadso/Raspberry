@@ -199,6 +199,7 @@ def main():
     try:
         while True:
             now = time.monotonic()
+            next_redraw=0
             if now >= next_redraw:
                 next_redraw = now + 0.5
                 presses += 1
