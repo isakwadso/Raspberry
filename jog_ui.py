@@ -711,7 +711,7 @@ def main():
           f"IN1 -> {valve_mod.IN1_SETS.upper()}, "
           f"pulse {valve_mod.PULSE_S * 1000:.0f} ms "
           f"(pulse length and IN1 mapping still to be verified)")
-    JogUI().run()
+    InjectCycle().run()
 
 
 if __name__ == "__main__":
