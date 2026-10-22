@@ -2,10 +2,20 @@
 """
 Takasago WLB-3 latching 3-way diaphragm valve, driven by a DRV8871 H-bridge.
 
-PLUMBING (assumed -- confirm with the bench test below):
-    common (IN) port -> syringe
-    NO port          -> target line (heater block and nozzle)
-    NC port          -> refill line (pouch)
+PLUMBING (datasheet port letters):
+    A (common) -> syringe
+    B and C    -> one to the target line (heater block and nozzle), the other
+                  to the refill line (pouch). Which is which is set by the
+                  plumbing; the bench test below tells the code.
+
+DATASHEET (WLB-3R(K)-N4F(G)):
+    energising time 0.2-1 s, duty cycle 10 % or less (5 min max on),
+    rated 12 or 24 V DC, 8 W, media and ambient 5-50 C.
+    12 V lead colours and resulting port states:
+        +12 V on BLUE, GND on RED  -> C opens, B closes   (status "X")
+        +12 V on RED,  GND on BLUE -> B opens, C closes   (status "Y")
+    An IN1 pulse drives OUT1 high and OUT2 low. So with BLUE on OUT1 and RED
+    on OUT2, IN1 opens C; with the leads the other way round, IN1 opens B.
 
 THE VALVE HAS NO CLOSED STATE. The syringe is always connected to exactly one
 of the two lines, so the interface is a position, TARGET or REFILL, not
@@ -45,11 +55,12 @@ from the same supply and reports Low VIN, which stops jog_ui.py at startup.
 
 BENCH TEST
     python3 valves.py
-pulses IN1 or IN2 on demand, so you can find which pulse opens which port and
+pulses IN1 or IN2 on demand, so you can find which pulse opens which line and
 set IN1_SETS below.
 """
 
 import time
+from collections import deque
 
 import pins
 
@@ -66,19 +77,27 @@ POSITIONS = (TARGET, REFILL)
 # the valve or the driver board.
 SIMULATE = False
 
-# Coil energising time per switch. ASSUMED VALUE -- check it against the WLB
-# datasheet. Too short and the valve may not latch reliably; longer than
-# needed only heats the coil (about 8 W while it is on).
-PULSE_S = 0.05
+# Coil energising time per switch. The datasheet range is 0.2-1 s; 0.3 s gives
+# margin over the minimum without heating the coil more than needed (8 W while
+# it is on). If the valve ever fails to switch reliably, raise this towards
+# 0.5 s before suspecting anything else.
+PULSE_S = 0.3
 
 # Wait after a switch before pushing or pulling liquid through the valve, so
-# the diaphragm has seated. Check against the datasheet response time.
+# the diaphragm has seated. The valve moves during the pulse itself; this is
+# extra margin.
 VALVE_SETTLE_S = 0.15
 
-# Minimum time between two pulses, to protect a coil rated for intermittent
-# duty only (someone hammering the toggle). A command that arrives sooner
-# waits out the remainder, so this is also the longest extra blocking time.
+# Minimum time between two pulses, so a double tap does not fire two pulses
+# back to back. A command that arrives sooner waits out the remainder.
 MIN_PULSE_INTERVAL_S = 0.25
+
+# Duty-cycle limit from the datasheet: the coil may be on at most 10 % of the
+# time. Checked over a rolling window. A normal inject cycle uses about
+# 3 x 0.3 s = 0.9 s per minute (1.5 %), so only rapid manual toggling can
+# reach the limit; the UI then refuses the toggle until the coil has cooled.
+DUTY_MAX = 0.10
+DUTY_WINDOW_S = 60.0
 
 # Which position a pulse on IN1 gives (current OUT1 -> OUT2 through the coil).
 # ASSUMPTION until the bench test. If it is wrong, change it here or swap the
@@ -100,8 +119,13 @@ class Valves:
     MIN_PULSE_INTERVAL_S if the previous pulse was very recent). That is a
     deliberate exception to the non-blocking rule elsewhere: the pulse must
     end even if the program is interrupted, and a blocking pulse inside
-    try/finally guarantees it. Tens of milliseconds is far inside the Tic's
-    command timeout.
+    try/finally guarantees it. 0.3 s (0.55 s at most) stays inside the Tic's
+    command timeout (1 s by default) -- but poll the actuator right before
+    switching, as jog_ui.py does, so the timeout starts fresh.
+
+    Commands from the program's own sequences (cycle, homing, abort,
+    shutdown) always pulse, so the valve always reaches a safe position.
+    Manual controls should check duty_ok() first.
     """
 
     def __init__(self, verbose=True, initial=REST_POSITION):
@@ -110,6 +134,7 @@ class Valves:
         self.verbose = verbose
         self.position = None                # unknown until the first pulse
         self._last_pulse = float("-inf")
+        self._history = deque()             # (start, end) of recent pulses
         self._lines = {}                    # 1 -> IN1 pin, 2 -> IN2 pin
 
         if not SIMULATE:
@@ -144,12 +169,36 @@ class Valves:
     def to_rest(self):
         self.set_position(REST_POSITION)
 
+    # -- duty cycle -----------------------------------------------------------
+
+    def _on_time_in_window(self):
+        cutoff = time.monotonic() - DUTY_WINDOW_S
+        while self._history and self._history[0][1] < cutoff:
+            self._history.popleft()
+        return sum(end - max(start, cutoff) for start, end in self._history)
+
+    def duty_ok(self):
+        """True if one more pulse keeps the coil within its rated duty cycle
+        (DUTY_MAX over the last DUTY_WINDOW_S)."""
+        return self._on_time_in_window() + PULSE_S <= DUTY_MAX * DUTY_WINDOW_S
+
+    # -- the pulse ------------------------------------------------------------
+
     def _pulse(self, line):
         wait = self._last_pulse + MIN_PULSE_INTERVAL_S - time.monotonic()
         if wait > 0:
             time.sleep(wait)
 
-        if not SIMULATE:
+        if not self.duty_ok() and self.verbose:
+            # Sequences still pulse (see the class docstring); one pulse over
+            # the budget does no harm, a pattern of them would.
+            print("  [valve] WARNING: coil duty cycle above "
+                  f"{DUTY_MAX:.0%} over the last {DUTY_WINDOW_S:.0f} s")
+
+        start = time.monotonic()
+        if SIMULATE:
+            end = start + PULSE_S           # count it as if it had happened
+        else:
             active = self._lines[line]
             self._lines[3 - line].value = False     # the other input: 1 <-> 2
             try:
@@ -159,8 +208,10 @@ class Valves:
                 # Whatever happens -- Ctrl+C, an exception -- the coil must not
                 # stay energised: a latching coil is rated for pulses only.
                 active.value = False
+            end = time.monotonic()
 
-        self._last_pulse = time.monotonic()
+        self._history.append((start, end))
+        self._last_pulse = end
 
     # -- shutdown -----------------------------------------------------------
 
@@ -183,10 +234,10 @@ class Valves:
 
 def bench_test():
     print("Valve bench test: 1 = pulse IN1, 2 = pulse IN2, q = quit.")
-    print("After each pulse, push a little air or water into the common (IN)")
-    print("port with a syringe and see whether it leaves through NO or NC.")
-    print("NO goes to the target line and NC to the pouch, so set")
-    print("IN1_SETS = TARGET if an IN1 pulse opens NO, or REFILL if it opens NC.")
+    print("After each pulse, push a little air or water into the common port A")
+    print("with a syringe and see which line it leaves through. Then set")
+    print("IN1_SETS = TARGET if an IN1 pulse opens the line to the nozzle,")
+    print("or REFILL if it opens the line to the pouch.")
     print(f"Pulse length {PULSE_S * 1000:.0f} ms.")
     if SIMULATE:
         print("SIMULATE is True -- nothing will move.")
@@ -198,6 +249,9 @@ def bench_test():
             if cmd in ("q", "quit"):
                 break
             if cmd in ("1", "2"):
+                if not v.duty_ok():
+                    print("  coil duty cycle limit reached -- wait a little")
+                    continue
                 v._pulse(int(cmd))
                 print(f"  pulsed IN{cmd}")
             elif cmd:

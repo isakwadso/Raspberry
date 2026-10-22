@@ -136,7 +136,8 @@ class InjectCycle:
     Like Actuator, nothing here waits: start() kicks it off and poll() advances
     it one step at a time from the main loop, so the display stays live and the
     touch panel stays responsive throughout. (The one exception is the valve
-    pulse itself, which blocks for valves.PULSE_S -- tens of milliseconds.)
+    pulse itself, which blocks for valves.PULSE_S -- 0.3 s -- while the
+    plunger is still.)
 
     Steps:
         1. valve to TARGET (syringe -> heater block and nozzle), settle
@@ -212,6 +213,7 @@ class InjectCycle:
         if self.aborting:
             if not self.act.busy:
                 try:
+                    self.act.poll()     # fresh Tic command timeout
                     self.valves.to_rest()
                 finally:
                     self.state = self.FAILED
@@ -251,6 +253,9 @@ class InjectCycle:
         return self.state
 
     def _switch_valve(self, position, next_state):
+        # The pulse blocks for valves.PULSE_S; poll first so the Tic's
+        # command timeout starts fresh.
+        self.act.poll()
         self.valves.set_position(position)
         # Settle time counts from the end of the pulse, not from the command.
         self._deadline = time.monotonic() + valve_mod.VALVE_SETTLE_S
@@ -279,14 +284,19 @@ class JogUI:
 
     def __init__(self):
         self.tft = PiTFT()
-        self.act = Actuator(microstep_divisor=16)
+        # Valve first: its startup pulse (to rest) blocks for PULSE_S, and
+        # doing it before the Tic is energised keeps that time out of the
+        # Tic's command timeout.
         self.valves = Valves()
+        self.act = Actuator(microstep_divisor=16)
         self.cycle = InjectCycle(self.act, self.valves)
 
         self.font_key = load_font(26, bold=True)
         self.font_big = load_font(30, bold=True)
         self.font_act = load_font(24, bold=True)
-        self.font_mode = load_font(15, bold=True)
+        # Header buttons (mode, valve). 12 px is the largest size at which
+        # "OPERATION" fits the 88 px mode button.
+        self.font_mode = load_font(12, bold=True)
         self.font_mid = load_font(18)
         self.font_small = load_font(15)
 
@@ -457,7 +467,9 @@ class JogUI:
         liquid into the wrong line."""
         if self.mode != MODE_SETUP:
             return
-        enabled = not (self.act.busy or self.cycle.running)
+        # Also greyed out while the coil is at its duty-cycle limit.
+        enabled = not (self.act.busy or self.cycle.running
+                       or not self.valves.duty_ok())
         key = (self.valves.position, enabled)
         if key == self._last_valve_drawn and not force:
             return
@@ -484,10 +496,18 @@ class JogUI:
         would suck liquid and air back in through the nozzle, so the valve
         goes to REFILL first. The main loop puts it back to rest once the
         actuator has stopped, whether homing succeeded or was stopped."""
-        self.valves.set_position(REFILL)
+        self._valve_to(REFILL)
         self.act.start_home()
         self._valve_back_to_rest = True
         self.status = "homing"
+
+    def _valve_to(self, position):
+        """Every valve switch from the UI goes through here. The pulse blocks
+        the loop for valves.PULSE_S (plus up to MIN_PULSE_INTERVAL_S), so the
+        actuator is polled first: the Tic's command timeout (1 s by default)
+        then starts fresh and the block stays well inside it."""
+        self.act.poll()
+        self.valves.set_position(position)
 
     def _start_move(self, sign):
         if not self.entry:
@@ -536,8 +556,11 @@ class JogUI:
             return
 
         if key == "VALVE":
+            if not self.valves.duty_ok():
+                self.status = "valve coil cooling, wait"
+                return
             new = REFILL if self.valves.position == TARGET else TARGET
-            self.valves.set_position(new)
+            self._valve_to(new)
             self.status = f"valve to {new}"
             return
 
@@ -616,12 +639,12 @@ class JogUI:
                 # stopped, never while it moves.
                 if self._valve_back_to_rest and not self.act.busy:
                     self._valve_back_to_rest = False
-                    self.valves.to_rest()
+                    self._valve_to(valve_mod.REST_POSITION)
 
                 # Future pollers (temperature measurement, heater control) go
                 # here. A valve switch blocks this loop for valves.PULSE_S
-                # (about 50 ms), so anything time-critical, such as a heater
-                # PWM, should run in hardware or tolerate that.
+                # (0.3 s), so anything time-critical, such as a heater PWM,
+                # should run in hardware or tolerate a 0.3-0.55 s gap.
 
                 if cycle_state != last_cycle_state:
                     last_cycle_state = cycle_state
