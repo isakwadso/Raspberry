@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
 """
-
 Touchscreen syringe-dispenser interface, two screens.
 
-    SETUP      manual control for rigging up: keypad, PUSH, PULL, STOP.
-               Same as before.
+    SETUP      manual control for rigging up and priming: keypad, PUSH, PULL,
+               STOP, and a valve toggle in the header, labelled with the
+               position it will switch TO.
 
     OPERATION  routine use: keypad and a single INJECT button that runs the
-               full cycle -- open target valve, push, close target, open
-               refill, pull, close refill.
+               full cycle -- valve to target, push, valve to refill, pull,
+               valve back to rest.
 
     The mode button sits in the top right corner and switches between them.
 
+Valve rules (see valves.py for the valve itself):
+    * The valve is only switched while the plunger is still. Switching while
+      liquid moves would push it into, or pull it from, the wrong line.
+    * Every homing run starts by switching the valve to REFILL. Homing drags
+      the plunger back an unknown distance; with the valve on the target line
+      that would suck liquid and air back in through the nozzle. The valve
+      returns to rest once homing has finished.
+    * Startup, abort and shutdown leave the valve at REST_POSITION.
+
 Pressing SETUP while an injection cycle is running ABORTS the cycle (ramped
-stop, valves closed). That is deliberate: the Operation screen has no STOP
+stop, then the valve to rest). That is deliberate: the Operation screen has no STOP
 button by request, and until physical end stops are fitted there needs to be
 some way to interrupt a cycle that was started with a wrong volume. To remove
 it, delete the marked block in handle_key().
@@ -33,7 +42,7 @@ import time
 from PIL import Image, ImageDraw, ImageFont
 
 from pitft import PiTFT
-from actuator import Actuator, IDLE, STOPPING, ERROR
+from actuator import Actuator, IDLE, STOPPING, ERROR, STALLED
 import valves as valve_mod
 from valves import Valves, TARGET, REFILL
 
@@ -122,28 +131,36 @@ class Button:
 # ---------------------------------------------------------------------------
 
 class InjectCycle:
-    """Runs the six-step inject sequence without blocking.
+    """Runs the inject sequence without blocking.
 
     Like Actuator, nothing here waits: start() kicks it off and poll() advances
     it one step at a time from the main loop, so the display stays live and the
-    touch panel stays responsive throughout.
+    touch panel stays responsive throughout. (The one exception is the valve
+    pulse itself, which blocks for valves.PULSE_S -- tens of milliseconds.)
 
     Steps:
-        1. open valve to target container
+        1. valve to TARGET (syringe -> heater block and nozzle), settle
         2. push the entered volume forward
-        3. close target valve
-        4. open valve to refill container
-        5. pull the same volume back
-        6. close refill valve
+        3. valve to REFILL (syringe -> pouch), settle
+        4. pull the same volume back
+        5. valve back to rest, settle
+
+    The valve is only ever switched while the plunger is still. That is also
+    why abort() does not move the valve at once: it stops the actuator, waits
+    in ABORTING until the plunger has actually stopped, and only then sends
+    the valve to rest.
+
+    Later additions (the HX1 post-dose pull-back ramp with the valve still at
+    TARGET, purge doses) slot in as extra states between PUSH and TO_REFILL.
     """
 
     IDLE = "idle"
-    OPEN_TARGET = "open target"
+    TO_TARGET = "valve to target"
     PUSH = "pushing"
-    CLOSE_TARGET = "close target"
-    OPEN_REFILL = "open refill"
+    TO_REFILL = "valve to refill"
     PULL = "drawing up"
-    CLOSE_REFILL = "close refill"
+    TO_REST = "valve to rest"
+    ABORTING = "aborting"
     DONE = "done"
     FAILED = "failed"
 
@@ -159,27 +176,31 @@ class InjectCycle:
     def running(self):
         return self.state not in (self.IDLE, self.DONE, self.FAILED)
 
+    @property
+    def aborting(self):
+        return self.state == self.ABORTING
+
     def start(self, volume_ul):
         if self.running:
             return False, "cycle already running"
         if not self.act.homed:
             return False, "home first"
+        if self.act.busy:
+            return False, "actuator busy"
         if volume_ul <= 0:
             return False, "volume must be > 0"
 
         self._volume_ul = volume_ul
-        self.valves.open(TARGET)
-        self._deadline = time.monotonic() + valve_mod.VALVE_SETTLE_S
-        self.state = self.OPEN_TARGET
+        self._switch_valve(TARGET, self.TO_TARGET)
         self.message = f"cycle: {volume_ul} {MICRO}l"
         return True, self.message
 
     def abort(self, reason="aborted"):
-        if not self.running:
+        """Stop the plunger now; the valve follows once it has stopped."""
+        if not self.running or self.aborting:
             return
-        self.act.stop()
-        self.valves.close_all()
-        self.state = self.FAILED
+        self.act.stop()             # ramped; a no-op if the actuator is idle
+        self.state = self.ABORTING
         self.message = reason
 
     def poll(self):
@@ -188,56 +209,59 @@ class InjectCycle:
         if not self.running:
             return self.state
 
-        now = time.monotonic()
-        mm = self._volume_ul * MM_PER_UL
+        if self.aborting:
+            if not self.act.busy:
+                try:
+                    self.valves.to_rest()
+                finally:
+                    self.state = self.FAILED
+            return self.state
 
-        # Any actuator fault stops the cycle where it stands, with the valves
-        # closed. Leaving a valve open after a failed move would leave the
-        # target line connected to a syringe in an unknown state.
-        if self.act.state in (ERROR,) or self.act.state == "stalled":
+        # Any actuator fault stops the cycle where it stands. A fault means
+        # the plunger is already halted, so the abort puts the valve to rest
+        # on the next poll.
+        if self.act.state in (ERROR, STALLED):
             self.abort(f"actuator: {self.act.message}")
             return self.state
 
-        if self.state == self.OPEN_TARGET:
+        now = time.monotonic()
+        mm = self._volume_ul * MM_PER_UL
+
+        if self.state == self.TO_TARGET:
             if now >= self._deadline:
-                ok, msg = self.act.start_move_relative(PUSH_SIGN * mm)
-                if not ok:
-                    self.abort(f"push refused: {msg}")
-                else:
-                    self.state = self.PUSH
+                self._start_stroke(PUSH_SIGN * mm, self.PUSH, "push")
 
         elif self.state == self.PUSH:
             if not self.act.busy:
-                self.valves.close(TARGET)
-                self._deadline = now + valve_mod.VALVE_SETTLE_S
-                self.state = self.CLOSE_TARGET
+                self._switch_valve(REFILL, self.TO_REFILL)
 
-        elif self.state == self.CLOSE_TARGET:
+        elif self.state == self.TO_REFILL:
             if now >= self._deadline:
-                self.valves.open(REFILL)
-                self._deadline = now + valve_mod.VALVE_SETTLE_S
-                self.state = self.OPEN_REFILL
-
-        elif self.state == self.OPEN_REFILL:
-            if now >= self._deadline:
-                ok, msg = self.act.start_move_relative(-PUSH_SIGN * mm)
-                if not ok:
-                    self.abort(f"pull refused: {msg}")
-                else:
-                    self.state = self.PULL
+                self._start_stroke(-PUSH_SIGN * mm, self.PULL, "pull")
 
         elif self.state == self.PULL:
             if not self.act.busy:
-                self.valves.close(REFILL)
-                self._deadline = now + valve_mod.VALVE_SETTLE_S
-                self.state = self.CLOSE_REFILL
+                self._switch_valve(valve_mod.REST_POSITION, self.TO_REST)
 
-        elif self.state == self.CLOSE_REFILL:
+        elif self.state == self.TO_REST:
             if now >= self._deadline:
                 self.state = self.DONE
                 self.message = f"done: {self._volume_ul} {MICRO}l"
 
         return self.state
+
+    def _switch_valve(self, position, next_state):
+        self.valves.set_position(position)
+        # Settle time counts from the end of the pulse, not from the command.
+        self._deadline = time.monotonic() + valve_mod.VALVE_SETTLE_S
+        self.state = next_state
+
+    def _start_stroke(self, delta_mm, next_state, name):
+        ok, msg = self.act.start_move_relative(delta_mm)
+        if ok:
+            self.state = next_state
+        else:
+            self.abort(f"{name} refused: {msg}")
 
 
 # ---------------------------------------------------------------------------
@@ -245,8 +269,12 @@ class InjectCycle:
 # ---------------------------------------------------------------------------
 
 class JogUI:
-    ENTRY_X, ENTRY_Y, ENTRY_W, ENTRY_H = 8, 6, 290, 40
+    # The entry field is narrower than before to make room for the valve
+    # toggle between it and the mode button.
+    ENTRY_X, ENTRY_Y, ENTRY_W, ENTRY_H = 8, 6, 272, 40
     STATUS_X, STATUS_Y, STATUS_W, STATUS_H = 8, 50, 464, 30
+    # Column offsets inside the status line: position, valve, message.
+    STATUS_VALVE_DX, STATUS_MSG_DX = 168, 284
     BODY_TOP = 84
 
     def __init__(self):
@@ -270,7 +298,11 @@ class JogUI:
         self._last_entry_drawn = None
         self._last_status_drawn = None
         self._last_homed = None
+        self._last_valve_drawn = None
         self._touch_down = False
+        # Set when a homing run has moved the valve to REFILL; the main loop
+        # returns it to rest once the plunger has stopped.
+        self._valve_back_to_rest = False
 
     # -- layout -------------------------------------------------------------
 
@@ -295,6 +327,11 @@ class JogUI:
         self.mode_button = Button("MODE", "OPERATION", 386, 6, 88, 36,
                                   MODE_FILL, MODE_EDGE, font=self.font_mode)
 
+        # Valve toggle, Setup screen only, between the volume field and the
+        # mode button. Label and colour are set by refresh_valve_button().
+        self.valve_button = Button("VALVE", "VALVE", 284, 6, 96, 36,
+                                   KEY_FILL, KEY_EDGE, font=self.font_mode)
+
         bx, bw = 266, 208
         # Setup screen actions.
         self.push_button = Button("PUSH", "PUSH", bx, 88, bw, 66,
@@ -311,7 +348,8 @@ class JogUI:
     def active_buttons(self):
         common = self.keypad + [self.mode_button]
         if self.mode == MODE_SETUP:
-            return common + [self.push_button, self.pull_button, self.stop_button]
+            return common + [self.valve_button, self.push_button,
+                             self.pull_button, self.stop_button]
         return common + [self.inject_button]
 
     # -- rendering ----------------------------------------------------------
@@ -333,9 +371,11 @@ class JogUI:
         self._last_entry_drawn = None
         self._last_status_drawn = None
         self._last_homed = None
+        self._last_valve_drawn = None
         self.draw_entry(force=True)
         self.draw_status(force=True)
         self.refresh_action_buttons(force=True)
+        self.refresh_valve_button(force=True)
 
     def _entry_text(self):
         if not self.entry:
@@ -359,10 +399,12 @@ class JogUI:
     def draw_status(self, force=False):
         pos = self.act.position_mm
         if self.act.homed:
-            pos_text = f"pos {pos:7.2f} mm / {pos / MM_PER_UL:6.0f} {MICRO}l"
+            pos_text = f"{pos:7.2f} mm {pos / MM_PER_UL:6.0f} {MICRO}l"
         else:
             pos_text = "position unknown"
-        key = (self.status, pos_text)
+        valve = self.valves.position
+        valve_text = f"valve {valve.upper()}" if valve else "valve ?"
+        key = (self.status, pos_text, valve_text)
         if key == self._last_status_drawn and not force:
             return
         self._last_status_drawn = key
@@ -370,7 +412,10 @@ class JogUI:
         img = Image.new("RGB", (self.STATUS_W, self.STATUS_H), PANEL)
         d = ImageDraw.Draw(img)
         d.text((4, 4), pos_text, font=self.font_small, fill=TEXT)
-        d.text((250, 4), self.status, font=self.font_small, fill=DIM)
+        d.text((self.STATUS_VALVE_DX, 4), valve_text,
+               font=self.font_small, fill=TEXT)
+        d.text((self.STATUS_MSG_DX, 4), self.status,
+               font=self.font_small, fill=DIM)
         self.tft.draw_region(img, self.STATUS_X, self.STATUS_Y)
 
     def refresh_action_buttons(self, force=False):
@@ -404,7 +449,45 @@ class JogUI:
         for b in targets:
             self.tft.draw_region(b.render(), b.x, b.y)
 
+    def refresh_valve_button(self, force=False):
+        """Setup screen only. The label names the position a tap switches TO,
+        coloured like the action that uses that line: teal (INJECT) for the
+        target line, blue (PULL) for the refill line. Greyed out while the
+        plunger moves or a cycle runs, because switching then would push
+        liquid into the wrong line."""
+        if self.mode != MODE_SETUP:
+            return
+        enabled = not (self.act.busy or self.cycle.running)
+        key = (self.valves.position, enabled)
+        if key == self._last_valve_drawn and not force:
+            return
+        self._last_valve_drawn = key
+
+        b = self.valve_button
+        next_pos = REFILL if self.valves.position == TARGET else TARGET
+        b.label = f"\u2192 {next_pos.upper()}"
+        if not enabled:
+            b.fill, b.edge = DISABLED, KEY_EDGE
+        elif next_pos == TARGET:
+            b.fill, b.edge = INJECT_FILL, INJECT_EDGE
+        else:
+            b.fill, b.edge = PULL_FILL, PULL_EDGE
+        self.tft.draw_region(b.render(), b.x, b.y)
+
     # -- input --------------------------------------------------------------
+
+    def _start_home(self):
+        """Home with the syringe connected to the pouch.
+
+        Homing drags the plunger back until it stalls against the retracted
+        stop -- an unknown distance. With the valve on the target line that
+        would suck liquid and air back in through the nozzle, so the valve
+        goes to REFILL first. The main loop puts it back to rest once the
+        actuator has stopped, whether homing succeeded or was stopped."""
+        self.valves.set_position(REFILL)
+        self.act.start_home()
+        self._valve_back_to_rest = True
+        self.status = "homing"
 
     def _start_move(self, sign):
         if not self.entry:
@@ -425,7 +508,9 @@ class JogUI:
                 self.cycle.abort("aborted by mode switch")
                 self.status = self.cycle.message
             # ------------------------------------------
-            if self.cycle.running:
+            # An aborting cycle finishes in the background (the main loop
+            # keeps polling it), so the screen can switch right away.
+            if self.cycle.running and not self.cycle.aborting:
                 return
             self.mode = (MODE_OPERATION if self.mode == MODE_SETUP
                          else MODE_SETUP)
@@ -447,7 +532,13 @@ class JogUI:
                 self.status = "cleared"
             return
 
-        if self.act.busy:
+        if self.act.busy or self.cycle.running:
+            return
+
+        if key == "VALVE":
+            new = REFILL if self.valves.position == TARGET else TARGET
+            self.valves.set_position(new)
+            self.status = f"valve to {new}"
             return
 
         if key == "PUSH":
@@ -459,8 +550,7 @@ class JogUI:
 
         if key == "PULL":
             if not self.act.homed:
-                self.act.start_home()
-                self.status = "homing"
+                self._start_home()
                 return
             self._start_move(-PUSH_SIGN)
             return
@@ -473,8 +563,7 @@ class JogUI:
 
         if key == "INJECT":
             if not self.act.homed:
-                self.act.start_home()
-                self.status = "homing"
+                self._start_home()
                 return
             if not self.entry:
                 self.status = "no volume set"
@@ -511,17 +600,28 @@ class JogUI:
             print(self.act.message)
             return
 
-        self.act.start_home()
-        self.status = "homing"
         last_state = None
         last_cycle_state = None
 
         try:
+            self._start_home()
+
             while True:
                 # Both pollers, every iteration. act.poll() also feeds the
                 # Tic's command-timeout watchdog, so it is never optional.
                 state = self.act.poll()
                 cycle_state = self.cycle.poll()
+
+                # After a homing run, back to rest -- once the plunger has
+                # stopped, never while it moves.
+                if self._valve_back_to_rest and not self.act.busy:
+                    self._valve_back_to_rest = False
+                    self.valves.to_rest()
+
+                # Future pollers (temperature measurement, heater control) go
+                # here. A valve switch blocks this loop for valves.PULSE_S
+                # (about 50 ms), so anything time-critical, such as a heater
+                # PWM, should run in hardware or tolerate that.
 
                 if cycle_state != last_cycle_state:
                     last_cycle_state = cycle_state
@@ -554,6 +654,7 @@ class JogUI:
                     self._touch_down = False
 
                 self.refresh_action_buttons()
+                self.refresh_valve_button()
                 self.draw_entry()
                 self.draw_status()
 
@@ -567,8 +668,14 @@ class JogUI:
                 self.act.poll()
                 time.sleep(0.02)
         finally:
-            self.valves.close_all()
+            # Order matters: the plunger stops (de-energised) before the valve
+            # moves, the valve is left at rest, then everything is released.
             self.act.close()
+            try:
+                self.valves.to_rest()
+            except Exception as exc:
+                print(f"could not put the valve to rest: {exc}")
+            self.valves.close()
             self.tft.close()
 
 
@@ -576,7 +683,11 @@ def main():
     print(f"syringe bore {SYRINGE_BORE_MM}mm -> "
           f"{MM_PER_UL:.4f} mm per {MICRO}l "
           f"({1.0 / MM_PER_UL:.1f} {MICRO}l per mm)")
-    print("valves are PLACEHOLDERS -- see valves.py")
+    print(f"valve: {'SIMULATED' if valve_mod.SIMULATE else 'GPIO'}, "
+          f"rest {valve_mod.REST_POSITION.upper()}, "
+          f"IN1 -> {valve_mod.IN1_SETS.upper()}, "
+          f"pulse {valve_mod.PULSE_S * 1000:.0f} ms "
+          f"(pulse length and IN1 mapping still to be verified)")
     JogUI().run()
 
 
