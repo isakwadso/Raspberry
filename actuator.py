@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-
 Non-blocking control layer for an Actuonix S20-100 linear actuator driven by a
 Pololu Tic T825 over USB.
 
@@ -11,9 +10,17 @@ STOP button possible: the same ~20ms loop can read the touchscreen, repaint
 the display and supervise the actuator, instead of sitting inside a while-loop
 waiting for the Tic to report arrival.
 
+The motor is energised only while it moves. Once an operation has finished
+and the actuator has been idle for HOLD_BEFORE_DEENERGIZE_S, the coils are
+switched off: no holding current, no motor heating, and no 16 kHz tone from
+the Tic's current chopping. The next command energises it again. Unpowered,
+the S20 resists 10 N of back-drive force (Actuonix datasheet), and the Tic's
+position counter is unaffected, so the rotor returns to the commanded
+microstep when re-energised -- at most half a full step (5 um) away.
+
 Typical use:
 
-    act = Actuator(microstep_divisor=16)
+    act = Actuator()
     act.start_home()
     while True:
         act.poll()                      # call this EVERY loop iteration
@@ -36,8 +43,18 @@ from ticlib import TicUSB
 # Motion configuration
 # ---------------------------------------------------------------------------
 FULL_STEP_MM = 0.01          # Actuonix S20 datasheet: 0.01mm per full step
-TARGET_SPEED_MM_S = 6.0      # real-world speed, held constant across whichever
+TARGET_SPEED_MM_S = 4.0      # real-world speed, held constant across whichever
                              # microstep resolution is selected
+
+# 1/8 step. Coarser microstepping gives more force (the Actuonix datasheet
+# notes that microstepping reduces maximum force); 1/8 of 0.01 mm is still
+# 1.25 um, about 0.025 ul with a 5 mm bore.
+MICROSTEP_DIVISOR = 8
+
+# How long the motor stays energised after an operation finishes before the
+# coils are switched off. Lets the mechanics settle under holding current and
+# avoids an off/on flicker between moves that follow each other closely.
+HOLD_BEFORE_DEENERGIZE_S = 0.5
 RAMP_TIME_S = 0.3            # accelerate from starting speed to target speed
 
 MIN_POSITION_MM = -10000.0        # 0 = the homed (retracted hard stop) position
@@ -86,6 +103,14 @@ STOPPING = "stopping"
 ERROR = "error"
 STALLED = "stalled"
 
+# Tic "Error status" bits (Pololu Tic user's guide, variable reference).
+ERR_INTENTIONALLY_DEENERGIZED = 1 << 0   # set by deenergize(), cleared by energize()
+ERR_SAFE_START_VIOLATION = 1 << 7        # cleared by exit_safe_start()
+# Both are expected while the coils are off on purpose, so they are ignored
+# then. Every other bit (Low VIN, motor driver error, command timeout, ...)
+# is still reported as a fault, energised or not.
+_EXPECTED_WHILE_OFF = ERR_INTENTIONALLY_DEENERGIZED | ERR_SAFE_START_VIOLATION
+
 
 def to_int(value):
     """Some ticlib getters return array.array rather than a plain int
@@ -96,7 +121,7 @@ def to_int(value):
 
 
 class Actuator:
-    def __init__(self, microstep_divisor=16):
+    def __init__(self, microstep_divisor=MICROSTEP_DIVISOR):
         if microstep_divisor not in STEP_MODE_VALUES:
             raise ValueError(f"microstep_divisor must be one of {sorted(STEP_MODE_VALUES)}")
 
@@ -106,6 +131,7 @@ class Actuator:
         self.tic = TicUSB()
         self.tic.energize()
         self.tic.exit_safe_start()
+        self._energized = True
 
         self.state = IDLE
         self.message = ""
@@ -113,6 +139,7 @@ class Actuator:
 
         self._deadline = 0.0        # when the current operation must be done by
         self._target_steps = 0
+        self._deenergize_at = None  # when an idle, energised motor switches off
 
         # Checked after exit_safe_start, not before: a fresh Tic always reports
         # a safe-start violation until exit_safe_start() is called, which is
@@ -124,6 +151,39 @@ class Actuator:
             self.message = f"Tic error at startup: {error:#06x}"
 
         self._configure_motion()
+
+        # Idle from the start: the first command energises the motor.
+        self._deenergize()
+
+    # -- energising -----------------------------------------------------------
+
+    def _energize(self):
+        """Switch the coils on before a command that moves the motor. The
+        Tic's position counter is unaffected by de-energising, so the rotor
+        is pulled back to the commanded microstep."""
+        if not self._energized:
+            self.tic.energize()
+            self._energized = True
+        self._deenergize_at = None
+        # De-energising re-arms safe start; a move command would be silently
+        # ignored without this.
+        self.tic.exit_safe_start()
+
+    def _deenergize(self):
+        if self._energized:
+            self.tic.deenergize()
+            self._energized = False
+        self._deenergize_at = None
+
+    def _go_idle(self, message):
+        """Finish an operation: idle now, coils off after the hold time."""
+        self.state = IDLE
+        self.message = message
+        self._deenergize_at = time.monotonic() + HOLD_BEFORE_DEENERGIZE_S
+
+    @property
+    def energized(self):
+        return self._energized
 
     # -- configuration ------------------------------------------------------
 
@@ -168,6 +228,7 @@ class Actuator:
         home_target = -int(round(HOME_OVERTRAVEL_MM / self.mm_per_step))
         home_sps = HOME_SPEED_MM_S / self.mm_per_step
 
+        self._energize()
         self.tic.set_max_speed(int(home_sps * 10000))
         self.tic.exit_safe_start()
         self.tic.set_target_position(home_target)
@@ -193,7 +254,7 @@ class Actuator:
         start_mm = self.position_mm
         self._target_steps = int(round(target_mm / self.mm_per_step))
 
-        self.tic.exit_safe_start()
+        self._energize()            # also exits safe start
         self.tic.set_target_position(self._target_steps)
 
         distance = abs(target_mm - start_mm)
@@ -245,19 +306,26 @@ class Actuator:
             return self.state
 
         error = to_int(self.tic.get_error_status())
+        if not self._energized:
+            error &= ~_EXPECTED_WHILE_OFF
         if error and self.state != HOMING:
             # Errors are expected during homing: stalling against the hard
             # stop is the whole point, and the Tic may flag it.
             self.state = ERROR
             self.message = f"Tic error {error:#06x} -- see `ticcmd -s`"
+            self._deenergize()
             return self.state
 
         now = time.monotonic()
 
-        if self.state == MOVING:
+        if self.state == IDLE:
+            if (self._energized and self._deenergize_at is not None
+                    and now >= self._deenergize_at):
+                self._deenergize()
+
+        elif self.state == MOVING:
             if to_int(self.tic.get_current_position()) == self._target_steps:
-                self.state = IDLE
-                self.message = "arrived"
+                self._go_idle("arrived")
             elif now > self._deadline:
                 # Open-loop: the Tic cannot tell us it stalled, so a move that
                 # overruns its predicted duration is the only signal we get.
@@ -265,6 +333,7 @@ class Actuator:
                 self.state = STALLED
                 self.homed = False
                 self.message = "move overran -- position lost, re-home"
+                self._deenergize()
 
         elif self.state == HOMING:
             if now > self._deadline:
@@ -275,9 +344,8 @@ class Actuator:
                 self.tic.exit_safe_start()
                 self._configure_motion()   # restore normal speed after homing's
                                            # slower profile
-                self.state = IDLE
                 self.homed = True
-                self.message = "homed"
+                self._go_idle("homed")
 
         elif self.state == STOPPING:
             velocity = to_int(self.tic.get_current_velocity())
@@ -288,8 +356,7 @@ class Actuator:
                 self._configure_motion()   # restore normal deceleration
                 self.tic.exit_safe_start()
                 self.tic.set_target_position(current)
-                self.state = IDLE
-                self.message = f"stopped at {current * self.mm_per_step:.2f}mm"
+                self._go_idle(f"stopped at {current * self.mm_per_step:.2f}mm")
 
         return self.state
 
@@ -301,6 +368,7 @@ class Actuator:
             self.tic.enter_safe_start()
         except Exception:
             pass
+        self._energized = False
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +379,7 @@ def main():
     """Exercises the non-blocking layer from the terminal. Note that the loop
     never blocks: it prints a live position while moving, which is exactly
     where the old code sat frozen inside wait_until_arrived()."""
-    act = Actuator(microstep_divisor=16)
+    act = Actuator()
     if act.state == ERROR:
         print(act.message)
         return

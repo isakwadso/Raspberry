@@ -288,7 +288,7 @@ class JogUI:
         # doing it before the Tic is energised keeps that time out of the
         # Tic's command timeout.
         self.valves = Valves()
-        self.act = Actuator(microstep_divisor=16)
+        self.act = Actuator()       # microstep divisor and speed: actuator.py
         self.cycle = InjectCycle(self.act, self.valves)
 
         self.font_key = load_font(26, bold=True)
