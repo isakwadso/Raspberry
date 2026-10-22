@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+
 PiTFT 3.5" resistive (HX8357D display + STMPE610 touch) on a Raspberry Pi 3,
 driven entirely from userspace over SPI -- no kernel framebuffer, no overlay,
 no X/Wayland.

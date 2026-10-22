@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+
 Non-blocking control layer for an Actuonix S20-100 linear actuator driven by a
 Pololu Tic T825 over USB.
 
