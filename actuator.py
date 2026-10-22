@@ -49,7 +49,7 @@ TARGET_SPEED_MM_S = 8.0      # real-world speed, held constant across whichever
 # 1/8 step. Coarser microstepping gives more force (the Actuonix datasheet
 # notes that microstepping reduces maximum force); 1/8 of 0.01 mm is still
 # 1.25 um, about 0.025 ul with a 5 mm bore.
-MICROSTEP_DIVISOR = 8
+MICROSTEP_DIVISOR = 4
 
 # How long the motor stays energised after an operation finishes before the
 # coils are switched off. Lets the mechanics settle under holding current and
