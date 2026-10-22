@@ -43,7 +43,7 @@ from ticlib import TicUSB
 # Motion configuration
 # ---------------------------------------------------------------------------
 FULL_STEP_MM = 0.01          # Actuonix S20 datasheet: 0.01mm per full step
-TARGET_SPEED_MM_S = 8.0      # real-world speed, held constant across whichever
+TARGET_SPEED_MM_S = 6.0      # real-world speed, held constant across whichever
                              # microstep resolution is selected
 
 # 1/8 step. Coarser microstepping gives more force (the Actuonix datasheet
