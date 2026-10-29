@@ -33,27 +33,32 @@ VALVE_IN2 = 27      # header pin 13 -> DRV8871 IN2
                     # header pin 9 (GND) -> DRV8871 logic GND
 
 # ---------------------------------------------------------------------------
-# Planned, not yet claimed by any code
+# Heater: 24 V 50 W cartridge through a logic-level MOSFET (heater.py)
 # ---------------------------------------------------------------------------
-# HEATER_GATE = 22  # header pin 15. Pulled down at boot, so the heater stays
-#                   # off until the program takes over. Fit a gate pull-down
-#                   # resistor on the MOSFET board as well, so the heater is
-#                   # also off if this pin is ever left floating.
-#
-# Temperature measurement depends on the sensor choice:
-#   - 1-Wire sensors (e.g. DS18B20) default to GPIO4, header pin 7.
-#   - An SPI ADC (e.g. ADS124S08) would share SPI0 with the PiTFT. Both of
-#     SPI0's hardware chip selects are taken, so it would need a GPIO as chip
-#     select, or SPI1, whose pins are only on the PiTFT's solder pads.
-#   - The HX1 control plan has a Pico over USB doing the RTD front end and the
-#     heater loop, which needs no GPIO here at all.
-#
-# Still free on the 2x13 header after the above: GPIO23 (pin 16), and
-# GPIO2/3 (I2C, pins 3/5) and GPIO14/15 (UART, pins 8/10) if those buses are
-# not needed. GPIO2/3 have fixed pull-up resistors on the Pi -- never use them
-# for anything that must be low at boot.
+HEATER_GATE = 22    # header pin 15. Pulled down at boot, so the heater stays
+                    # off until the program takes over. Fit a gate pull-down
+                    # resistor on the MOSFET board as well, so the heater is
+                    # also off if this pin is ever left floating.
 
-_CLAIMED = {"VALVE_IN1": VALVE_IN1, "VALVE_IN2": VALVE_IN2}
+# ---------------------------------------------------------------------------
+# Block temperature: DS18B20 on the kernel 1-Wire bus (heater.py)
+# ---------------------------------------------------------------------------
+ONEWIRE_DATA = 4    # header pin 7. Claimed by the kernel, not by Python:
+                    # dtoverlay=w1-gpio in /boot/firmware/config.txt (GPIO4
+                    # is the overlay's default; for another pin add
+                    # ,gpiopin=N). Listed here so nothing else lands on it.
+                    # 4.7 kOhm pull-up to 3.3 V (pin 1), sensor VDD on 3.3 V.
+
+# ---------------------------------------------------------------------------
+# Still free on the 2x13 header: GPIO23 (pin 16), and GPIO2/3 (I2C, pins
+# 3/5) and GPIO14/15 (UART, pins 8/10) if those buses are not needed.
+# GPIO2/3 have fixed pull-up resistors on the Pi -- never use them for
+# anything that must be low at boot. A second DS18B20 (e.g. at the inlet)
+# needs no pin of its own: it shares the 1-Wire bus on GPIO4.
+# ---------------------------------------------------------------------------
+
+_CLAIMED = {"VALVE_IN1": VALVE_IN1, "VALVE_IN2": VALVE_IN2,
+            "HEATER_GATE": HEATER_GATE, "ONEWIRE_DATA": ONEWIRE_DATA}
 
 
 def _check():

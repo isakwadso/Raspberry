@@ -1,16 +1,42 @@
 #!/usr/bin/env python3
 """
-Touchscreen syringe-dispenser interface, two screens.
+Touchscreen syringe-dispenser interface, three screens.
 
-    SETUP      manual control for rigging up and priming: keypad, PUSH, PULL,
-               STOP, and a valve toggle in the header, labelled with the
-               position it will switch TO.
+    SETUP        manual control for rigging up and priming: keypad, PUSH, PULL,
+                 STOP, and a valve toggle in the header, labelled with the
+                 position it will switch TO.
 
-    OPERATION  routine use: keypad and a single INJECT button that runs the
-               full cycle -- valve to target, push, valve to refill, pull,
-               valve back to rest.
+    OPERATION    routine use: keypad and a single INJECT button that runs the
+                 full cycle -- valve to target, push, valve to refill, pull,
+                 valve back to rest.
 
-    The mode button sits in the top right corner and switches between them.
+    TEMPERATURE  opened by tapping the temperature tile: keypad for the
+                 setpoint in whole degrees, SET (applies, saves and switches
+                 heating on), a heater on/off toggle labelled with what a tap
+                 will do, BACK, and a 30-minute trend.
+
+    The mode button sits in the top right corner and switches between SETUP
+    and OPERATION (on the temperature screen it reads BACK).
+
+The temperature tile sits at the right end of the status row on every screen:
+green READY, amber HEATING / SETTLING / COOLING, grey heater off, red fault.
+It can only be opened while the plunger is still and no cycle runs. The
+heater itself runs in heater.py's own threads and keeps regulating whatever
+screen is showing.
+
+Heater rules:
+    * INJECT is refused while the heater reports a fault (the INJECT button
+      greys out). Set REQUIRE_READY_TO_INJECT = True to also refuse it until
+      the tile is green. A heater that is switched OFF is not a fault: dosing
+      at room temperature stays possible.
+    * Every stroke that pushes liquid through the target line -- an INJECT
+      cycle, a manual PUSH with the valve on TARGET, or either of them stopped
+      partway -- is reported to the heater with the volume actually moved, for
+      the feed-forward (see heater.py).
+    * The setpoint and on/off state are saved in settings.json and restored at
+      the next start, so the block starts heating as soon as the program runs.
+      Heating stops when the program stops: for overnight equilibration leave
+      it running (in tmux, or as a systemd service).
 
 Valve rules (see valves.py for the valve itself):
     * The valve is only switched while the plunger is still. Switching while
@@ -30,21 +56,24 @@ it, delete the marked block in handle_key().
 Run:
     python3 jog_ui.py
 
-Imports pitft.py, actuator.py and valves.py from the same directory.
+Imports pitft.py, actuator.py, valves.py and heater.py from the same directory.
 
 REQUIRES in actuator.py, until physical end stops are fitted:
     MIN_POSITION_MM = -1000000.0
     MAX_POSITION_MM =  1000000.0
 """
 
+import signal
 import time
 
 from PIL import Image, ImageDraw, ImageFont
 
 from pitft import PiTFT
-from actuator import Actuator, IDLE, STOPPING, ERROR, STALLED
+from actuator import Actuator, IDLE, STOPPING, ERROR, STALLED, HOMING
 import valves as valve_mod
 from valves import Valves, TARGET, REFILL
+import heater as heater_mod
+from heater import Heater
 
 
 # ===========================================================================
@@ -60,13 +89,23 @@ MM_PER_UL = 1.0 / _BORE_AREA_MM2
 PUSH_SIGN = +1
 
 MAX_ENTRY_CHARS = 5
+MAX_TEMP_CHARS = 2
 MICRO = "\u00b5"
+DEG = "\u00b0"
 
 MODE_SETUP = "setup"
 MODE_OPERATION = "operation"
+MODE_TEMP = "temperature"
 
 # Set False to remove the cycle-abort behaviour described above.
 SETUP_BUTTON_ABORTS_CYCLE = True
+
+# False: INJECT is refused only on a heater fault. True: also until READY.
+REQUIRE_READY_TO_INJECT = False
+
+# Strokes through the target line smaller than this are not reported to the
+# heater (rounding noise, a nudge while priming).
+MIN_DOSE_FOR_FF_UL = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -91,8 +130,21 @@ INJECT_FILL = (25, 95, 95)
 INJECT_EDGE = (70, 215, 215)
 MODE_FILL   = (50, 40, 70)
 MODE_EDGE   = (150, 130, 200)
+SET_FILL    = (40, 40, 95)
+SET_EDGE    = (120, 120, 255)
 DISABLED    = (45, 45, 55)
 ACCENT      = (120, 120, 255)
+BAND_FILL   = (22, 55, 32)
+
+# Temperature tile: heater state -> (fill, edge, word on the second line).
+TILE_STYLES = {
+    heater_mod.READY:    (PUSH_FILL, PUSH_EDGE, "READY"),
+    heater_mod.SETTLING: (HOME_FILL, HOME_EDGE, "SETTLING"),
+    heater_mod.HEATING:  (HOME_FILL, HOME_EDGE, "HEATING"),
+    heater_mod.COOLING:  (HOME_FILL, HOME_EDGE, "COOLING"),
+    heater_mod.OFF:      (DISABLED,  KEY_EDGE,  "HEATER OFF"),
+    heater_mod.FAULT:    (STOP_FILL, STOP_EDGE, "FAULT"),
+}
 
 
 def load_font(size, bold=False):
@@ -126,6 +178,31 @@ class Button:
         return img
 
 
+class TempTile(Button):
+    """The temperature tile: a button with two centred lines, the reading on
+    top and the state below. Its text and colours are set by
+    JogUI.refresh_tile()."""
+
+    def __init__(self, x, y, w, h, font, font_sub):
+        super().__init__("TEMP", "", x, y, w, h, DISABLED, KEY_EDGE, font)
+        self.font_sub = font_sub
+        self.sub = ""
+
+    def render(self, pressed=False):
+        img = Image.new("RGB", (self.w, self.h),
+                        KEY_PRESSED if pressed else self.fill)
+        d = ImageDraw.Draw(img)
+        d.rectangle((0, 0, self.w - 1, self.h - 1), outline=self.edge)
+        bbox = d.textbbox((0, 0), self.label, font=self.font)
+        d.text(((self.w - (bbox[2] - bbox[0])) / 2 - bbox[0], 4 - bbox[1]),
+               self.label, font=self.font, fill=TEXT)
+        bbox = d.textbbox((0, 0), self.sub, font=self.font_sub)
+        d.text(((self.w - (bbox[2] - bbox[0])) / 2 - bbox[0],
+                self.h - 4 - (bbox[3] - bbox[1]) - bbox[1]),
+               self.sub, font=self.font_sub, fill=TEXT)
+        return img
+
+
 # ---------------------------------------------------------------------------
 # The injection cycle
 # ---------------------------------------------------------------------------
@@ -150,6 +227,9 @@ class InjectCycle:
     why abort() does not move the valve at once: it stops the actuator, waits
     in ABORTING until the plunger has actually stopped, and only then sends
     the valve to rest.
+
+    The heater's feed-forward is not triggered from here: JogUI reports every
+    stroke through the target line, from whichever source, once it has ended.
 
     Later additions (the HX1 post-dose pull-back ramp with the valve still at
     TARGET, purge doses) slot in as extra states between PUSH and TO_REFILL.
@@ -274,13 +354,18 @@ class InjectCycle:
 # ---------------------------------------------------------------------------
 
 class JogUI:
-    # The entry field is narrower than before to make room for the valve
-    # toggle between it and the mode button.
+    # Header: volume (or setpoint) field, valve or heater toggle, mode button.
     ENTRY_X, ENTRY_Y, ENTRY_W, ENTRY_H = 8, 6, 272, 40
-    STATUS_X, STATUS_Y, STATUS_W, STATUS_H = 8, 50, 464, 30
-    # Column offsets inside the status line: position, valve, message.
-    STATUS_VALVE_DX, STATUS_MSG_DX = 168, 284
-    BODY_TOP = 84
+    # Status row, two lines: position and valve on top, message below. It
+    # leaves the right end of the row to the temperature tile.
+    STATUS_X, STATUS_Y, STATUS_W, STATUS_H = 8, 50, 340, 42
+    STATUS_VALVE_DX = 168
+    STATUS_LINE2_DY = 23
+    TILE_X, TILE_Y, TILE_W, TILE_H = 352, 50, 122, 42
+    BODY_TOP = 96
+    # Temperature screen: trend plot under the SET button.
+    TREND_X, TREND_Y, TREND_W, TREND_H = 266, 160, 208, 152
+    TREND_SPAN_K = 1.0          # plot shows setpoint +- this
 
     def __init__(self):
         self.tft = PiTFT()
@@ -288,6 +373,9 @@ class JogUI:
         # doing it before the Tic is energised keeps that time out of the
         # Tic's command timeout.
         self.valves = Valves()
+        # Heater next: opens its gate pin low and loads settings.json. Its
+        # threads only start in run().
+        self.heater = Heater()
         self.act = Actuator()       # microstep divisor and speed: actuator.py
         self.cycle = InjectCycle(self.act, self.valves)
 
@@ -299,31 +387,41 @@ class JogUI:
         self.font_mode = load_font(12, bold=True)
         self.font_mid = load_font(18)
         self.font_small = load_font(15)
+        self.font_tile = load_font(21, bold=True)
+        self.font_axis = load_font(11)
 
         self.mode = MODE_SETUP
+        self._return_mode = MODE_SETUP      # where BACK goes from TEMPERATURE
         self.entry = ""
+        self.temp_entry = ""
         self.status = "starting"
 
         self._build_buttons()
         self._last_entry_drawn = None
         self._last_status_drawn = None
-        self._last_homed = None
+        self._last_action_drawn = None
         self._last_valve_drawn = None
+        self._last_tile_drawn = None
+        self._last_heat_drawn = None
+        self._last_trend_drawn = None
         self._touch_down = False
         # Set when a homing run has moved the valve to REFILL; the main loop
         # returns it to rest once the plunger has stopped.
         self._valve_back_to_rest = False
+        # Stroke bookkeeping for the heater's feed-forward: see _track_dose().
+        self._idle_pos_mm = None
+        self._stroke = None
 
     # -- layout -------------------------------------------------------------
 
     def _build_buttons(self):
-        # Shared keypad, present on both screens.
+        # Shared keypad, present on every screen.
         keys = [["7", "8", "9"],
                 ["4", "5", "6"],
                 ["1", "2", "3"],
                 ["00", "0", "<"]]
-        x0, y0 = 6, 88
-        cw, ch, gap = 80, 55, 4
+        x0, y0 = 6, 98
+        cw, ch, gap = 80, 52, 4
 
         self.keypad = []
         for row, labels in enumerate(keys):
@@ -332,8 +430,9 @@ class JogUI:
                     label, label,
                     x0 + col * (cw + gap), y0 + row * (ch + gap),
                     cw, ch, KEY_FILL, KEY_EDGE, font=self.font_key))
+        self.key_00 = next(b for b in self.keypad if b.key == "00")
 
-        # Mode switch, top right corner, present on both screens.
+        # Mode switch, top right corner, present on every screen.
         self.mode_button = Button("MODE", "OPERATION", 386, 6, 88, 36,
                                   MODE_FILL, MODE_EDGE, font=self.font_mode)
 
@@ -342,21 +441,36 @@ class JogUI:
         self.valve_button = Button("VALVE", "VALVE", 284, 6, 96, 36,
                                    KEY_FILL, KEY_EDGE, font=self.font_mode)
 
+        # Heater toggle, temperature screen only, in the same place.
+        self.heat_button = Button("HEAT", "HEAT", 284, 6, 96, 36,
+                                  KEY_FILL, KEY_EDGE, font=self.font_mode)
+
+        # Temperature tile, every screen; a button on Setup and Operation.
+        self.tile = TempTile(self.TILE_X, self.TILE_Y, self.TILE_W,
+                             self.TILE_H, self.font_tile, self.font_mode)
+
         bx, bw = 266, 208
         # Setup screen actions.
-        self.push_button = Button("PUSH", "PUSH", bx, 88, bw, 66,
+        self.push_button = Button("PUSH", "PUSH", bx, 98, bw, 60,
                                   PUSH_FILL, PUSH_EDGE, font=self.font_act)
-        self.pull_button = Button("PULL", "PULL", bx, 160, bw, 66,
+        self.pull_button = Button("PULL", "PULL", bx, 164, bw, 60,
                                   PULL_FILL, PULL_EDGE, font=self.font_act)
-        self.stop_button = Button("STOP", "STOP", bx, 232, bw, 82,
+        self.stop_button = Button("STOP", "STOP", bx, 230, bw, 82,
                                   STOP_FILL, STOP_EDGE, font=self.font_big)
 
         # Operation screen action: one tall button.
-        self.inject_button = Button("INJECT", "INJECT", bx, 88, bw, 226,
+        self.inject_button = Button("INJECT", "INJECT", bx, 98, bw, 214,
                                     INJECT_FILL, INJECT_EDGE, font=self.font_big)
 
+        # Temperature screen action.
+        self.set_button = Button("SET", "SET", bx, 98, bw, 56,
+                                 SET_FILL, SET_EDGE, font=self.font_act)
+
     def active_buttons(self):
-        common = self.keypad + [self.mode_button]
+        if self.mode == MODE_TEMP:
+            return self.keypad + [self.mode_button, self.heat_button,
+                                  self.set_button]
+        common = self.keypad + [self.mode_button, self.tile]
         if self.mode == MODE_SETUP:
             return common + [self.valve_button, self.push_button,
                              self.pull_button, self.stop_button]
@@ -365,29 +479,48 @@ class JogUI:
     # -- rendering ----------------------------------------------------------
 
     def draw_screen(self):
-        """Full repaint. Only happens at startup and on a mode switch -- never
-        inside the running loop, where 180ms of blindness would matter."""
+        """Full repaint. Only happens at startup and on a screen switch --
+        never inside the running loop, where 180ms of blindness would
+        matter."""
         bg = Image.new("RGB", (self.tft.width, self.tft.height), BG)
         d = ImageDraw.Draw(bg)
         d.rectangle((0, 0, self.tft.width - 1, self.BODY_TOP - 2),
                     fill=PANEL, outline=ACCENT)
         self.tft.draw_full(bg)
 
-        self.mode_button.label = ("OPERATION" if self.mode == MODE_SETUP
-                                  else "SETUP")
+        if self.mode == MODE_TEMP:
+            self.mode_button.label = "BACK"
+            self.key_00.label = ""          # setpoints are two digits
+        else:
+            self.mode_button.label = ("OPERATION" if self.mode == MODE_SETUP
+                                      else "SETUP")
+            self.key_00.label = "00"
         for b in self.active_buttons():
-            self.tft.draw_region(b.render(), b.x, b.y)
+            if b is not self.tile:
+                self.tft.draw_region(b.render(), b.x, b.y)
 
         self._last_entry_drawn = None
         self._last_status_drawn = None
-        self._last_homed = None
+        self._last_action_drawn = None
         self._last_valve_drawn = None
+        self._last_tile_drawn = None
+        self._last_heat_drawn = None
+        self._last_trend_drawn = None
+        snap = self.heater.snapshot()
         self.draw_entry(force=True)
-        self.draw_status(force=True)
-        self.refresh_action_buttons(force=True)
+        self.draw_status(self.act.position_mm, snap, force=True)
+        self.refresh_tile(snap, force=True)
+        self.refresh_action_buttons(snap, force=True)
         self.refresh_valve_button(force=True)
+        self.refresh_heat_button(snap, force=True)
+        self.draw_trend(snap, force=True)
 
     def _entry_text(self):
+        if self.mode == MODE_TEMP:
+            value = (f"{int(self.temp_entry)} {DEG}C" if self.temp_entry
+                     else f"-- {DEG}C")
+            return value, (f"range {heater_mod.SETPOINT_MIN_C}\u2013"
+                           f"{heater_mod.SETPOINT_MAX_C}")
         if not self.entry:
             return f"--- {MICRO}l", ""
         ul = int(self.entry)
@@ -406,35 +539,87 @@ class JogUI:
         d.text((150, 12), converted, font=self.font_mid, fill=DIM)
         self.tft.draw_region(img, self.ENTRY_X, self.ENTRY_Y)
 
-    def draw_status(self, force=False):
-        pos = self.act.position_mm
+    def _status_columns(self, pos, snap):
+        """Top line of the status row as [(x offset, text), ...]."""
+        if self.mode == MODE_TEMP:
+            cols = [(0, f"set {snap.setpoint_c} {DEG}C")]
+            if snap.fault:
+                cols.append((100, f"FAULT: {snap.fault}"))
+            elif not snap.enabled:
+                cols.append((100, "heater off"))
+            else:
+                cols.append((100, f"heater {snap.power_frac * 100:3.0f} %"))
+                if snap.in_band_s > 0:
+                    m, s = divmod(int(snap.in_band_s), 60)
+                    cols.append((212, f"in band {m}:{s:02d}"))
+                elif snap.temp_c is not None:
+                    cols.append((212, f"\u0394 {snap.temp_c - snap.setpoint_c:+.2f} K"))
+            return cols
+
         if self.act.homed:
             pos_text = f"{pos:7.2f} mm {pos / MM_PER_UL:6.0f} {MICRO}l"
         else:
             pos_text = "position unknown"
         valve = self.valves.position
         valve_text = f"valve {valve.upper()}" if valve else "valve ?"
-        key = (self.status, pos_text, valve_text)
+        return [(0, pos_text), (self.STATUS_VALVE_DX, valve_text)]
+
+    def draw_status(self, pos, snap, force=False):
+        cols = self._status_columns(pos, snap)
+        key = (self.status, tuple(cols))
         if key == self._last_status_drawn and not force:
             return
         self._last_status_drawn = key
 
         img = Image.new("RGB", (self.STATUS_W, self.STATUS_H), PANEL)
         d = ImageDraw.Draw(img)
-        d.text((4, 4), pos_text, font=self.font_small, fill=TEXT)
-        d.text((self.STATUS_VALVE_DX, 4), valve_text,
-               font=self.font_small, fill=TEXT)
-        d.text((self.STATUS_MSG_DX, 4), self.status,
+        for dx, text in cols:
+            d.text((4 + dx, 3), text, font=self.font_small, fill=TEXT)
+        d.text((4, self.STATUS_LINE2_DY), self.status,
                font=self.font_small, fill=DIM)
         self.tft.draw_region(img, self.STATUS_X, self.STATUS_Y)
 
-    def refresh_action_buttons(self, force=False):
+    def refresh_tile(self, snap, force=False):
+        """One decimal on purpose: the DS18B20 reads in 0.0625 K steps, so a
+        second decimal would only show the step pattern."""
+        fill, edge, word = TILE_STYLES.get(snap.state, TILE_STYLES[heater_mod.OFF])
+        text = (f"--.- {DEG}C" if snap.temp_c is None
+                else f"{snap.temp_c:.1f} {DEG}C")
+        if snap.state == heater_mod.FAULT:
+            sub = (snap.fault or "fault").upper()
+        elif snap.state == heater_mod.OFF:
+            sub = word
+        else:
+            sub = f"{word} \u2192 {snap.setpoint_c}"
+        key = (text, sub, fill)
+        if key == self._last_tile_drawn and not force:
+            return
+        self._last_tile_drawn = key
+        t = self.tile
+        t.label, t.sub, t.fill, t.edge = text, sub, fill, edge
+        self.tft.draw_region(t.render(), t.x, t.y)
+
+    def _inject_refusal(self, snap):
+        """Why INJECT would be refused because of the heater, or None."""
+        if snap.fault:
+            return f"heater {snap.fault}"
+        if (REQUIRE_READY_TO_INJECT and snap.enabled
+                and snap.state != heater_mod.READY):
+            return "temperature not ready"
+        return None
+
+    def refresh_action_buttons(self, snap, force=False):
         """PULL becomes HOME when the position is not trusted; PUSH and INJECT
         grey out, since driving forward from an unknown position is how you
-        crash into the far end stop."""
-        if self.act.homed == self._last_homed and not force:
+        crash into the far end stop. INJECT also greys out while the heater
+        would refuse it."""
+        if self.mode == MODE_TEMP:
             return
-        self._last_homed = self.act.homed
+        blocked = self._inject_refusal(snap) is not None
+        key = (self.mode, self.act.homed, blocked)
+        if key == self._last_action_drawn and not force:
+            return
+        self._last_action_drawn = key
 
         if self.mode == MODE_SETUP:
             if self.act.homed:
@@ -447,13 +632,16 @@ class JogUI:
                 self.push_button.fill, self.push_button.edge = DISABLED, KEY_EDGE
             targets = (self.push_button, self.pull_button)
         else:
-            if self.act.homed:
+            if not self.act.homed:
+                self.inject_button.label = "HOME"
+                self.inject_button.fill, self.inject_button.edge = HOME_FILL, HOME_EDGE
+            elif blocked:
+                self.inject_button.label = "INJECT"
+                self.inject_button.fill, self.inject_button.edge = DISABLED, KEY_EDGE
+            else:
                 self.inject_button.label = "INJECT"
                 self.inject_button.fill = INJECT_FILL
                 self.inject_button.edge = INJECT_EDGE
-            else:
-                self.inject_button.label = "HOME"
-                self.inject_button.fill, self.inject_button.edge = HOME_FILL, HOME_EDGE
             targets = (self.inject_button,)
 
         for b in targets:
@@ -485,6 +673,103 @@ class JogUI:
         else:
             b.fill, b.edge = PULL_FILL, PULL_EDGE
         self.tft.draw_region(b.render(), b.x, b.y)
+
+    def refresh_heat_button(self, snap, force=False):
+        """Temperature screen only. Like the valve toggle, the label names
+        what a tap does: red HEAT -> OFF while heating, amber HEAT -> ON while
+        off."""
+        if self.mode != MODE_TEMP:
+            return
+        if snap.enabled == self._last_heat_drawn and not force:
+            return
+        self._last_heat_drawn = snap.enabled
+        b = self.heat_button
+        if snap.enabled:
+            b.label = "HEAT \u2192 OFF"
+            b.fill, b.edge = STOP_FILL, STOP_EDGE
+        else:
+            b.label = "HEAT \u2192 ON"
+            b.fill, b.edge = HOME_FILL, HOME_EDGE
+        self.tft.draw_region(b.render(), b.x, b.y)
+
+    def draw_trend(self, snap, force=False):
+        """Temperature screen only: the last 30 min against setpoint +-
+        TREND_SPAN_K, with the READY band shaded. Values outside the window
+        are drawn on its edge. Redrawn when a new point arrives (every
+        heater.HISTORY_STEP_S), ~35 ms each time."""
+        if self.mode != MODE_TEMP:
+            return
+        key = (snap.history_version, snap.setpoint_c)
+        if key == self._last_trend_drawn and not force:
+            return
+        self._last_trend_drawn = key
+
+        w, h = self.TREND_W, self.TREND_H
+        img = Image.new("RGB", (w, h), PANEL)
+        d = ImageDraw.Draw(img)
+        d.rectangle((0, 0, w - 1, h - 1), outline=KEY_EDGE)
+        sp = snap.setpoint_c
+        lo, hi = sp - self.TREND_SPAN_K, sp + self.TREND_SPAN_K
+        top, bottom = 4, h - 18
+
+        def y_of(v):
+            v = min(max(v, lo), hi)
+            return int(round(top + (hi - v) / (hi - lo) * (bottom - top)))
+
+        band = heater_mod.STABLE_BAND_K
+        d.rectangle((1, y_of(sp + band), w - 2, y_of(sp - band)), fill=BAND_FILL)
+        for x in range(2, w - 2, 8):
+            d.line((x, y_of(sp), x + 4, y_of(sp)), fill=PUSH_EDGE)
+
+        history = self.heater.history()
+        if history:
+            t_end = time.monotonic()
+            span = heater_mod.HISTORY_S
+            pts = [(2 + (t - (t_end - span)) / span * (w - 4), y_of(v))
+                   for t, v in history if t >= t_end - span]
+            if len(pts) >= 2:
+                d.line(pts, fill=TEXT, width=1)
+            elif pts:
+                d.point(pts, fill=TEXT)
+
+        f = self.font_axis
+        d.text((4, h - 15), f"-{heater_mod.HISTORY_S / 60:.0f} min", font=f, fill=DIM)
+        bb = d.textbbox((0, 0), "now", font=f)
+        d.text((w - 6 - (bb[2] - bb[0]), h - 15), "now", font=f, fill=DIM)
+        d.text((w - 48, y_of(hi) - 1), f"{hi:.1f}{DEG}", font=f, fill=DIM)
+        d.text((w - 48, y_of(lo) - 12), f"{lo:.1f}{DEG}", font=f, fill=DIM)
+        self.tft.draw_region(img, self.TREND_X, self.TREND_Y)
+
+    # -- feed-forward bookkeeping ---------------------------------------------
+
+    def _track_dose(self, pos):
+        """Report every stroke that pushed liquid through the target line to
+        the heater, with the volume it actually moved.
+
+        Watches the actuator rather than the cycle, so an INJECT cycle, a
+        manual PUSH with the valve on TARGET, and either of them stopped
+        partway are all covered. Pulls, homing (valve on REFILL, and the
+        position is re-zeroed) and pushes back into the pouch are not. The
+        valve cannot change during a stroke, so its position on the first
+        busy iteration is the stroke's line; the start position is the last
+        reading while the plunger was still."""
+        if self.act.busy:
+            if self._stroke is None:
+                self._stroke = {"start_mm": self._idle_pos_mm,
+                                "valve": self.valves.position,
+                                "homing": False}
+            if self.act.state == HOMING:
+                self._stroke["homing"] = True
+            return
+
+        s, self._stroke = self._stroke, None
+        self._idle_pos_mm = pos
+        if (s is None or s["homing"] or s["valve"] != TARGET
+                or s["start_mm"] is None or not self.act.homed):
+            return
+        moved_ul = PUSH_SIGN * (pos - s["start_mm"]) / MM_PER_UL
+        if moved_ul >= MIN_DOSE_FOR_FF_UL:
+            self.heater.add_dose(moved_ul)
 
     # -- input --------------------------------------------------------------
 
@@ -521,7 +806,22 @@ class JogUI:
         self.status = msg if ok else f"refused: {msg}"
 
     def handle_key(self, key):
+        if key == "TEMP":
+            # Only while everything is still: the temperature screen has no
+            # STOP, and leaving it must not be the only way to see a move.
+            if self.act.busy or self.cycle.running:
+                return
+            self._return_mode = self.mode
+            self.mode = MODE_TEMP
+            self.temp_entry = ""
+            self.draw_screen()
+            return
+
         if key == "MODE":
+            if self.mode == MODE_TEMP:          # labelled BACK
+                self.mode = self._return_mode
+                self.draw_screen()
+                return
             # ---- cycle abort on leaving Operation ----
             # Delete this block to make the mode button purely a screen switch.
             if SETUP_BUTTON_ABORTS_CYCLE and self.cycle.running:
@@ -539,8 +839,10 @@ class JogUI:
 
         if self.mode == MODE_SETUP:
             self._handle_setup_key(key)
-        else:
+        elif self.mode == MODE_OPERATION:
             self._handle_operation_key(key)
+        else:
+            self._handle_temp_key(key)
 
     def _handle_setup_key(self, key):
         if key == "STOP":
@@ -578,7 +880,7 @@ class JogUI:
             self._start_move(-PUSH_SIGN)
             return
 
-        self._handle_keypad(key)
+        self.entry = self._edit(self.entry, key, MAX_ENTRY_CHARS)
 
     def _handle_operation_key(self, key):
         if self.cycle.running or self.act.busy:
@@ -591,20 +893,47 @@ class JogUI:
             if not self.entry:
                 self.status = "no volume set"
                 return
+            refusal = self._inject_refusal(self.heater.snapshot())
+            if refusal:
+                self.status = f"refused: {refusal}"
+                return
             ok, msg = self.cycle.start(int(self.entry))
             self.status = msg if ok else f"refused: {msg}"
             return
 
-        self._handle_keypad(key)
+        self.entry = self._edit(self.entry, key, MAX_ENTRY_CHARS)
 
-    def _handle_keypad(self, key):
+    def _handle_temp_key(self, key):
+        if key == "SET":
+            if not self.temp_entry:
+                self.status = "no temperature entered"
+                return
+            ok, msg = self.heater.set_setpoint(int(self.temp_entry))
+            self.status = msg if ok else f"refused: {msg}"
+            if ok:
+                self.temp_entry = ""
+            return
+
+        if key == "HEAT":
+            self.status = self.heater.set_enabled(not self.heater.enabled)
+            return
+
+        if key == "00":
+            return
+        self.temp_entry = self._edit(self.temp_entry, key, MAX_TEMP_CHARS)
+
+    @staticmethod
+    def _edit(buf, key, max_chars):
+        """Keypad editing of a digit string."""
         if key == "<":
-            self.entry = self.entry[:-1]
-        elif key == "00":
-            if self.entry and self.entry != "0":
-                self.entry = (self.entry + "00")[:MAX_ENTRY_CHARS]
-        elif key in "0123456789" and len(self.entry) < MAX_ENTRY_CHARS:
-            self.entry = key if self.entry in ("", "0") else self.entry + key
+            return buf[:-1]
+        if key == "00":
+            if buf and buf != "0":
+                return (buf + "00")[:max_chars]
+            return buf
+        if key in "0123456789" and len(key) == 1 and len(buf) < max_chars:
+            return key if buf in ("", "0") else buf + key
+        return buf
 
     def find_button(self, px, py):
         for b in self.active_buttons():
@@ -619,14 +948,18 @@ class JogUI:
 
         if self.act.state == ERROR:
             self.status = self.act.message
-            self.draw_status(force=True)
+            self.draw_status(0.0, self.heater.snapshot(), force=True)
             print(self.act.message)
+            self.heater.close()
             return
 
         last_state = None
         last_cycle_state = None
 
         try:
+            # Heating starts here (if settings.json says it was on) and runs
+            # in the heater's own threads from now on.
+            self.heater.start()
             self._start_home()
 
             while True:
@@ -634,6 +967,8 @@ class JogUI:
                 # Tic's command-timeout watchdog, so it is never optional.
                 state = self.act.poll()
                 cycle_state = self.cycle.poll()
+                # The heater switches itself off if this stops coming.
+                self.heater.heartbeat()
 
                 # After a homing run, back to rest -- once the plunger has
                 # stopped, never while it moves.
@@ -641,10 +976,10 @@ class JogUI:
                     self._valve_back_to_rest = False
                     self._valve_to(valve_mod.REST_POSITION)
 
-                # Future pollers (temperature measurement, heater control) go
-                # here. A valve switch blocks this loop for valves.PULSE_S
-                # (0.3 s), so anything time-critical, such as a heater PWM,
-                # should run in hardware or tolerate a 0.3-0.55 s gap.
+                # One position read per iteration (a USB transfer), shared by
+                # the feed-forward bookkeeping and the status row.
+                pos = self.act.position_mm
+                self._track_dose(pos)
 
                 if cycle_state != last_cycle_state:
                     last_cycle_state = cycle_state
@@ -676,10 +1011,14 @@ class JogUI:
                 elif hit is None:
                     self._touch_down = False
 
-                self.refresh_action_buttons()
+                snap = self.heater.snapshot()
+                self.refresh_action_buttons(snap)
                 self.refresh_valve_button()
+                self.refresh_heat_button(snap)
+                self.refresh_tile(snap)
                 self.draw_entry()
-                self.draw_status()
+                self.draw_status(pos, snap)
+                self.draw_trend(snap)
 
                 time.sleep(0.02)
 
@@ -691,8 +1030,14 @@ class JogUI:
                 self.act.poll()
                 time.sleep(0.02)
         finally:
-            # Order matters: the plunger stops (de-energised) before the valve
-            # moves, the valve is left at rest, then everything is released.
+            # Heater off first: it is the one output that does harm if left
+            # on. Then, as before, the plunger stops (de-energised) before the
+            # valve moves, the valve is left at rest, then everything is
+            # released.
+            try:
+                self.heater.close()
+            except Exception as exc:
+                print(f"could not close the heater cleanly: {exc}")
             self.act.close()
             try:
                 self.valves.to_rest()
@@ -702,7 +1047,22 @@ class JogUI:
             self.tft.close()
 
 
+def _install_signal_handlers():
+    """SIGTERM (systemctl stop, kill) and SIGHUP (the SSH session closed)
+    would otherwise end the program on the spot, skipping the shutdown in
+    run() -- and a GPIO keeps its last level when the process dies, so the
+    heater could stay on. Both are turned into the same clean stop as
+    Ctrl+C. A SIGHUP that is being ignored (nohup) is left ignored."""
+    def _interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _interrupt)
+    if signal.getsignal(signal.SIGHUP) is not signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, _interrupt)
+
+
 def main():
+    _install_signal_handlers()
     print(f"syringe bore {SYRINGE_BORE_MM}mm -> "
           f"{MM_PER_UL:.4f} mm per {MICRO}l "
           f"({1.0 / MM_PER_UL:.1f} {MICRO}l per mm)")
@@ -711,6 +1071,13 @@ def main():
           f"IN1 -> {valve_mod.IN1_SETS.upper()}, "
           f"pulse {valve_mod.PULSE_S * 1000:.0f} ms "
           f"(pulse length and IN1 mapping still to be verified)")
+    saved = heater_mod.load_settings()
+    print(f"heater: {'SIMULATED' if heater_mod.SIMULATE else 'DS18B20 + GPIO'}, "
+          f"setpoint {saved.get('setpoint_c', heater_mod.DEFAULT_SETPOINT_C)} {DEG}C, "
+          f"{'ON' if saved.get('heater_on') else 'off'} at start, "
+          f"offset {saved.get('sensor_offset_k', 0.0):+.2f} K, "
+          f"PI {heater_mod.KP_W_PER_K:g} W/K / {heater_mod.TI_S:g} s, "
+          f"feed-forward x{heater_mod.FF_GAIN:g}")
     JogUI().run()
 
 
