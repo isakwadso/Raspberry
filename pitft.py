@@ -67,6 +67,19 @@ SPI_BAUDRATE = 24000000
 MADCTL_REG = 0x36
 MADCTL_VALUE = 0x28
 
+# The panel's reset pin is not wired to a GPIO, so the HX8357D only ever gets
+# the library's SOFTWARE reset -- and adafruit_rgb_display sends the rest of
+# its setup immediately after it. The chip needs up to 120 ms after a software
+# reset when it was running (5 ms from sleep), and ignores commands sent
+# before that. When it was running -- any program restart without a power
+# cycle -- part of the setup can be lost. Losing SETPANEL (scan direction)
+# gives a left-right mirrored picture while touch stays correct (seen
+# 26 Nov 2026); only a power cycle cured it. So after the library's init we
+# wait, then send its setup again WITHOUT the reset, then MADCTL.
+RESET_SETTLE_S = 0.15
+_SWRESET = 0x01
+_SLPOUT = 0x11
+
 
 # ---------------------------------------------------------------------------
 # Touch calibration
@@ -118,11 +131,24 @@ class PiTFT:
             rst=None,                      # not wired to a GPIO on the PiTFT
             baudrate=SPI_BAUDRATE,
         )
+        self._resend_setup()
         self.display.write(MADCTL_REG, bytes([MADCTL_VALUE]))
 
         # Take the size from the driver rather than hardcoding 480x320.
         self.width = self.display.width
         self.height = self.display.height
+
+    def _resend_setup(self):
+        """Send the library's setup sequence a second time, minus the
+        software reset, once the chip has certainly finished resetting (see
+        RESET_SETTLE_S). Adds about 0.3 s to start-up."""
+        time.sleep(RESET_SETTLE_S)
+        for command, data in getattr(self.display, "_INIT", ()):
+            if command == _SWRESET:
+                continue
+            self.display.write(command, data)
+            if command == _SLPOUT:
+                time.sleep(RESET_SETTLE_S)
 
     # -- drawing ------------------------------------------------------------
 

@@ -90,7 +90,9 @@ REQUIRES in actuator.py, until physical end stops are fitted:
     MAX_POSITION_MM =  1000000.0
 """
 
+import os
 import signal
+import sys
 import time
 
 from PIL import Image, ImageDraw, ImageFont
@@ -1184,7 +1186,53 @@ def _install_signal_handlers():
         signal.signal(signal.SIGHUP, _interrupt)
 
 
+LOCK_PATHS = ("/run/lock/jog_ui.lock", "/tmp/jog_ui.lock")
+
+
+def single_instance_lock():
+    """Take a lock that only one running copy of this program can hold.
+
+    Returns the open lock file (keep it open while running), False if
+    another copy holds it, or None if no lock could be taken at all (then
+    we run anyway). Two copies would both drive the PiTFT's shared SPI bus,
+    and a second copy's display set-up in the middle of the first's drawing
+    can leave the panel in a wrong state (e.g. mirrored) until a power
+    cycle -- as well as fighting over the Tic and the valve.
+
+    flock is released by the kernel when the process ends, however it ends,
+    so a crash never leaves a stale lock. The file is opened read-only, so
+    it works whichever user created it (a copy started with sudo, say)."""
+    try:
+        import fcntl
+    except ImportError:             # not Linux: no guard
+        return None
+    for path in LOCK_PATHS:
+        try:
+            try:
+                fd = os.open(path, os.O_RDONLY)
+            except FileNotFoundError:
+                fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o644)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return False
+        except OSError:
+            os.close(fd)
+            continue
+        return fd
+    return None
+
+
 def main():
+    lock = single_instance_lock()
+    if lock is False:
+        print("jog_ui.py is already running -- the service, or a copy started "
+              "by hand. Stop it first (sudo systemctl stop jog-ui.service, or "
+              "Ctrl+C in the other terminal).")
+        sys.exit(1)
     _install_signal_handlers()
     print(f"syringe bore {SYRINGE_BORE_MM}mm -> "
           f"{MM_PER_UL:.4f} mm per {MICRO}l "
