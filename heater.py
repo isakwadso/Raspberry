@@ -208,7 +208,9 @@ TI_S = 1200.0
 INTEGRAL_BAND_K = 1.5
 # Estimated steady loss per kelvin above the room, used to preload the
 # integrator. HX1 design note: about 2.3 W at 60 C in a 20 C room.
-LOSS_W_PER_K = 0.06
+# Measured 26 Nov 2026: about 3.6 W held the block at ~59.9 C (estimate
+# was 0.06 W/K).
+LOSS_W_PER_K = 0.09
 
 # -- feed-forward -----------------------------------------------------------
 INLET_TEMP_C = 21.0             # syringe, valve and pouch are at room temp
@@ -545,7 +547,7 @@ class SimBlock:
     C_H = 440.0             # J/K
     C_O = 440.0             # J/K
     G_HO = 12.0             # W/K: 6082 through a 60 mm disc over 40 mm
-    G_AMB = 0.03            # W/K from each half to the room
+    G_AMB = 0.045           # W/K from each half to the room (measured total 0.09)
     TAU_PROBE_S = 20.0
     DOSE_FRACTION_H = 0.9
     DOSE_SPREAD_S = 30.0    # how fast a cold dose takes up its heat
@@ -742,6 +744,7 @@ class Heater:
         self._last_raw = None
         self._jump_pending = None
         self.sensor_note = ""           # why the last read failed, if it did
+        self._resolution_warned = False
 
         self._last_heartbeat = None
         self._history = deque(maxlen=int(HISTORY_S / HISTORY_STEP_S))
@@ -939,10 +942,24 @@ class Heater:
         if len(lines) < 2 or not lines[0].endswith("YES"):
             self.sensor_note = "CRC error"
             return None
-        if all(b == "00" for b in lines[0].split(":")[0].split()):
+        data = lines[0].split(":")[0].split()
+        if all(b == "00" for b in data):
             # A data line held low reads as all zeros, whose CRC is also zero.
             self.sensor_note = "all-zero data (DQ shorted to GND?)"
             return None
+        # Byte 4 is the configuration register: 0x7f = 12-bit (0.0625 K).
+        # The block's first sensor came set to 10-bit (0.25 K steps), which
+        # made the reading flip 59.75 <-> 60.00 and kept it from ever
+        # reaching READY (STABLE_BAND_K is 0.15 K). Warn once, with the fix.
+        if len(data) > 4 and not self._resolution_warned:
+            bits = 9 + ((int(data[4], 16) >> 5) & 3)
+            if bits < 12:
+                self._resolution_warned = True
+                print(f"  [heater] WARNING: DS18B20 set to {bits}-bit "
+                      f"({0.0625 * 2 ** (12 - bits):g} K steps). Fix once, it "
+                      f"is saved in the sensor:\n"
+                      f"    echo 12   | sudo tee {W1_DEVICES}/28-*/resolution\n"
+                      f"    echo save | sudo tee {W1_DEVICES}/28-*/eeprom_cmd")
         pos = lines[1].find("t=")
         if pos < 0:
             self.sensor_note = "no t= in w1_slave"
