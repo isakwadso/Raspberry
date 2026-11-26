@@ -208,9 +208,11 @@ TI_S = 1200.0
 INTEGRAL_BAND_K = 1.5
 # Estimated steady loss per kelvin above the room, used to preload the
 # integrator. HX1 design note: about 2.3 W at 60 C in a 20 C room.
-# Measured 26 Nov 2026: about 3.6 W held the block at ~59.9 C (estimate
-# was 0.06 W/K).
-LOSS_W_PER_K = 0.09
+# Measured 26 Nov 2026: 2.4 W held 60.1 C once the insulation gaps were
+# closed and it had warmed through (3.6 W an hour earlier, not yet steady).
+# Only preloads the integrator at start; a wrong value costs a slow
+# 20-30 min approach (Ti = 1200 s), not accuracy.
+LOSS_W_PER_K = 0.06
 
 # -- feed-forward -----------------------------------------------------------
 INLET_TEMP_C = 21.0             # syringe, valve and pouch are at room temp
@@ -547,7 +549,7 @@ class SimBlock:
     C_H = 440.0             # J/K
     C_O = 440.0             # J/K
     G_HO = 12.0             # W/K: 6082 through a 60 mm disc over 40 mm
-    G_AMB = 0.045           # W/K from each half to the room (measured total 0.09)
+    G_AMB = 0.03            # W/K from each half to the room (measured total ~0.06)
     TAU_PROBE_S = 20.0
     DOSE_FRACTION_H = 0.9
     DOSE_SPREAD_S = 30.0    # how fast a cold dose takes up its heat
