@@ -52,19 +52,22 @@ FEED-FORWARD
         E = FF_GAIN * V * LIQUID_J_PER_ML_K * (setpoint - INLET_TEMP_C),
     is queued per control window and delivered on top of the PI output, at
     a constant rate over FF_SPREAD_S from the window it came in. So for a
-    1 ml dose at 60 C the heater gets about 140 J extra -- about 4.7 W for
-    30 s -- starting within 2 s of the plunger starting to move. A pull-back
+    7.5 ml dose at 60 C the heater gets about 1050 J extra -- about 35 W
+    for 30 s -- starting within 2 s of the plunger starting to move (the
+    push itself takes about 7 s). A pull-back
     takes its share off what is still queued. Energy that does not fit
     under HEATER_MAX_W is carried over, not lost.
     FF_GAIN is below 1 on purpose: under-compensating costs a small dip that
     the PI removes; over-compensating costs an overshoot that only the losses
     remove.
 
-    When the feed-forward is right, the probe shows almost nothing: in the
-    block model a 1 ml dose dips the probe by about 0.3 K without it and
-    stays within about +-0.04 K with it -- below one 0.0625 K sensor step.
-    Watch the heater power on the temperature screen, the "FF ... J" note
-    there and in the status line, or the log (below), not the tile.
+    In the block model (SimBlock), ten 7.5 ml doses a minute apart take the
+    probe down about 2.3 K without feed-forward. With it they stay within
+    about -0.25/+0.10 K at FF_GAIN 0.9 (the missing 10 % adds up from dose
+    to dose until the PI catches up) and within about +-0.08 K at 1.0. So
+    when it is right the probe moves only a sensor step or two: watch the
+    heater power on the temperature screen, the "FF ... J" note there and
+    in the status line, or the log (below), rather than the tile.
 
 LOG
     One CSV line per control window (2 s) in logs/heater_YYYY-MM-DD.csv next
@@ -209,6 +212,8 @@ INLET_TEMP_C = 21.0             # syringe, valve and pouch are at room temp
 # Volumetric heat capacity of the dosed liquid. About 4.0 J/(ml K) for 1 M
 # KOH (density ~1.05 g/ml, cp ~3.8-3.9 J/(g K)); water is 4.18.
 LIQUID_J_PER_ML_K = 4.0
+# Starting value, on the safe side. The block model says about 1.0; the
+# real number comes from `python3 heater.py --report` after a dosing run.
 FF_GAIN = 0.9
 # The heat each window's liquid needs is delivered over this long. About the
 # time the cold liquid takes to come to block temperature plus the time heat

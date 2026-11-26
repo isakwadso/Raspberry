@@ -36,7 +36,7 @@ Heater rules:
       heater starts replacing the heat within one control window (2 s) of
       the plunger starting to move, instead of after the stroke.
     * After each INJECT the status line shows the feed-forward energy, e.g.
-      "done: 1000 µl, FF 140 J", and the temperature screen shows what is
+      "done: 7500 µl, FF 1053 J", and the temperature screen shows what is
       still queued ("FF 95 J"). "FF 0 J" with the heater on means the
       feed-forward did not run.
     * The setpoint and on/off state are saved in settings.json and restored at
@@ -52,9 +52,12 @@ Pull-back (INJECT only):
     with the valve still on TARGET,
         KOH_EXPANSION_VS_WATER x (expansion of water from INLET_TEMP_C to the
         block temperature) x dose + PULLBACK_MARGIN_UL,
-    i.e. a little more than the dose can expand. For 1000 ul at 60 C that is
-    about 22 ul. The meniscus then sits that far inside the tip, and the
-    expansion brings it back towards the tip without reaching it.
+    i.e. a little more than the dose can expand. For 7500 ul at 60 C that is
+    about 129 ul (113 ul expansion + 11 + 5), 0.68 mm of plunger travel.
+    The meniscus moves that far back from the tip, and the expansion brings
+    it back towards the tip without reaching it. Part of the expansion
+    already happens during the 7 s push, so the meniscus ends up somewhat
+    further inside than the margin alone.
     With PULLBACK_COMPENSATE the push is made longer by the same amount, so
     the plunger's net travel towards the nozzle -- the dose -- is still the
     entered volume, and the refill pull is exactly the entered volume. The
@@ -103,7 +106,11 @@ from heater import Heater
 # ===========================================================================
 # CHANGE THIS WHEN YOU CHANGE SYRINGE
 # ===========================================================================
-SYRINGE_BORE_MM = 5.0        # internal diameter of the syringe barrel
+# Internal diameter of the syringe barrel. 15.5 mm measured (10 ml syringe):
+# 188.7 mm^2, so 1 ml = 5.30 mm of plunger travel and 7.5 ml = 39.8 mm.
+# (Was 5.0 until Nov 2026 -- every volume, and so the feed-forward, came
+# out 9.6x too small.)
+SYRINGE_BORE_MM = 15.5
 # ===========================================================================
 
 _BORE_AREA_MM2 = 3.141592653589793 * (SYRINGE_BORE_MM / 2.0) ** 2
@@ -1192,7 +1199,7 @@ def main():
     if PULLBACK_ENABLED:
         print(f"pull-back: {KOH_EXPANSION_VS_WATER:g} x expansion + "
               f"{PULLBACK_MARGIN_UL:g} {MICRO}l after {PULLBACK_DELAY_S:g} s "
-              f"(1000 {MICRO}l at 60 {DEG}C: {pullback_ul(1000, 60):.1f} {MICRO}l), "
+              f"(7500 {MICRO}l at 60 {DEG}C: {pullback_ul(7500, 60):.1f} {MICRO}l), "
               f"{'compensated' if PULLBACK_COMPENSATE else 'not compensated'}")
     else:
         print("pull-back: off")
