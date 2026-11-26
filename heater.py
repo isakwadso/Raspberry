@@ -219,9 +219,11 @@ INLET_TEMP_C = 21.0             # syringe, valve and pouch are at room temp
 # Volumetric heat capacity of the dosed liquid. About 4.0 J/(ml K) for 1 M
 # KOH (density ~1.05 g/ml, cp ~3.8-3.9 J/(g K)); water is 4.18.
 LIQUID_J_PER_ML_K = 4.0
-# Starting value, on the safe side. The block model says about 1.0; the
-# real number comes from `python3 heater.py --report` after a dosing run.
-FF_GAIN = 0.9
+# Measured 26 Nov 2026 (--report, 8 x 7500 ul water, room 22 C): the doses
+# took 1170 J each = exactly FF_GAIN 1.00 with the constants above; at 0.9
+# the block fell ~0.05 K per dose. 1 M KOH needs ~2 % less per ml than water
+# (estimate) -- check with a KOH run.
+FF_GAIN = 1.0
 # The heat each window's liquid needs is delivered over this long. About the
 # time the cold liquid takes to come to block temperature plus the time heat
 # takes to spread from the cartridge to the turns (~15 s through 30 mm of

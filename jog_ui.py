@@ -106,11 +106,17 @@ from heater import Heater
 # ===========================================================================
 # CHANGE THIS WHEN YOU CHANGE SYRINGE
 # ===========================================================================
-# Internal diameter of the syringe barrel. 15.5 mm measured (10 ml syringe):
-# 188.7 mm^2, so 1 ml = 5.30 mm of plunger travel and 7.5 ml = 39.8 mm.
+# Internal diameter of the syringe barrel -- the EFFECTIVE value from the
+# volume calibration, not a measurement. 15.5 mm measured (10 ml syringe);
+# calibrated 26 Nov 2026 to 15.53: 4 doses of 7500 ul water weighed
+# 7.50/7.51/7.51/7.51 g = 7.532 ml at 22 C (buoyancy-corrected), i.e. 0.43 %
+# more than entered with 15.5. 189.4 mm^2: 1 ml = 5.28 mm of plunger travel.
+# The entered volume is liquid at syringe (room) temperature; at 60 C the
+# same liquid takes 1.5 % more room. Recalibrate with a new syringe type,
+# and once the actuator no longer skips steps without help.
 # (Was 5.0 until Nov 2026 -- every volume, and so the feed-forward, came
 # out 9.6x too small.)
-SYRINGE_BORE_MM = 15.5
+SYRINGE_BORE_MM = 15.53
 # ===========================================================================
 
 _BORE_AREA_MM2 = 3.141592653589793 * (SYRINGE_BORE_MM / 2.0) ** 2

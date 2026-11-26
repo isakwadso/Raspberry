@@ -4,6 +4,8 @@ ssh biometric@BiometricRaspberryPi.local
 cd ~/Raspberry
 source env/bin/activate
 
+sudo poweroff
+
 ping BiometricRaspberryPi.local
 
 python3 blink.py
@@ -29,3 +31,16 @@ pip install RpiMotorLib RPi.GPIO
 python3 ActuatorDriver.py
 
 28-0000063dd85d  w1_bus_master1
+
+Kalibrera för sensorn:
+The DS18B20 is only specified to ±0.5 °C absolute, so 60.0 on the screen can be up to half a degree off the true temperature. 
+Your requirement is 0.1 °C at the outlet, so while you calibrate the volumes, also measure the temperature of the liquid 
+at the tip with a reference thermometer. 
+The difference goes into the sensor offset in settings.json (sensor_offset_k).
+
+Restart after new code:
+sudo systemctl stop jog-ui.service          # 1. stop, when no dose is running
+cd ~/Raspberry && git pull                  # 2. update
+sync                                        # 3. write everything to the SD card
+sudo systemctl start jog-ui.service         # 4. start
+journalctl -u jog-ui -n 12 --no-pager       # 5. check
