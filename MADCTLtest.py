@@ -22,6 +22,15 @@ mirror, a rotation and a red/blue swap each look different from one another:
     | BLUE                    |
     +-------------------------+
 
+It starts the display exactly as pitft.py does (the library's start-up plus
+the waits it lacks), so the value found here is the one jog_ui.py needs. Until
+26 Nov 2026 it used the library's start-up directly; without the waits, part
+of the setup (the panel's scan direction) was often lost, so the value found
+then -- 0x28 -- was right only for that half-set-up state.
+
+Stop the service first (sudo systemctl stop jog-ui.service): two programs must
+not drive the display at once.
+
 Reading the result:
   - Text mirrored / RED square on the right  -> wrong MX
   - RED square at the bottom                 -> wrong MY
@@ -34,7 +43,8 @@ import board
 import digitalio
 from PIL import Image, ImageDraw, ImageFont
 
-import adafruit_rgb_display.hx8357 as hx8357
+# The library's HX8357 driver plus the start-up waits -- see pitft.py.
+from pitft import _HX8357
 from adafruit_stmpe610 import Adafruit_STMPE610_SPI
 
 # MADCTL bit meanings, for reference when adjusting by hand:
@@ -92,7 +102,7 @@ def main():
     # display's init sequence and leaves the panel blank.
     touch = Adafruit_STMPE610_SPI(spi, digitalio.DigitalInOut(board.CE1))
 
-    display = hx8357.HX8357(
+    display = _HX8357(
         spi,
         cs=digitalio.DigitalInOut(board.CE0),
         dc=digitalio.DigitalInOut(board.D25),
