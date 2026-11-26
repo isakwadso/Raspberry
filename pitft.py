@@ -59,13 +59,19 @@ SPI_BAUDRATE = 24000000
 # HX8357D memory-access-control register. Set once at init so mirroring and
 # colour order are handled in HARDWARE -- every draw, full or partial, is then
 # correct with no per-frame transform and no coordinate fiddling inside
-# draw_region(). Determined empirically with madctl_test.py:
+# draw_region(). Determined with MADCTLtest.py, which starts the display the
+# same way as below (26 Nov 2026):
 #   0x20 MV  - row/column exchange, i.e. 480x320 landscape
-#   0x08 BGR - this panel wants BGR byte order, not RGB
+#   0x80 MY  - row address order: undoes the left-right mirror that the
+#              library's SETPANEL ("gate direction swapped") gives
+#   BGR off  - SETPANEL already selects BGR; setting it here too would swap
+#              red and blue back
+# The earlier value, 0x28 (MV | BGR), was found with a start-up that usually
+# lost SETPANEL, so it was right only for that half-set-up state.
 # Do NOT also set display.rotation: that applies a second, software transform
 # inside image(), which fights this one and misplaces draw_region's offsets.
 MADCTL_REG = 0x36
-MADCTL_VALUE = 0x28
+MADCTL_VALUE = 0xA0
 
 # Waits after specific start-up commands. The panel's reset pin is not wired
 # to a GPIO, so the HX8357D only gets the library's SOFTWARE reset -- and
