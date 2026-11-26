@@ -109,6 +109,9 @@ WIRING
               on the MOSFET board. GPIO22 is pulled down while the Pi boots.
 
 SETTINGS
+    With the read-only overlay file system on (operation), changes are kept
+    only until power-off, and the UI says so; set the setpoint and heater
+    state you want at every power-on with the overlay off.
     settings.json next to this file holds setpoint_c, heater_on and
     sensor_offset_k. It is written (atomically: temp file, fsync, rename)
     only when the setpoint or on/off changes, so a power cut cannot leave it
@@ -283,6 +286,23 @@ def _clamp(value, lo, hi):
 # ---------------------------------------------------------------------------
 # Settings file
 # ---------------------------------------------------------------------------
+
+def root_is_read_only():
+    """True when the Pi runs with the read-only overlay file system
+    (raspi-config -> Performance Options -> Overlay File System). Everything
+    written -- settings, logs, code -- then lives in RAM and is gone at the
+    next power-off; the card itself is never written, so pulling the plug
+    is safe."""
+    try:
+        with open("/proc/mounts", "r", encoding="utf-8") as f:
+            return any(len(p) > 2 and p[1] == "/" and p[2] == "overlay"
+                       for p in (line.split() for line in f))
+    except OSError:
+        return False
+
+
+ROOT_READ_ONLY = root_is_read_only()
+
 
 def load_settings(path=None):
     """Return the saved settings as a dict, or {} if there are none. A
@@ -594,8 +614,11 @@ def _log_params():
 class CsvLog:
     """One CSV file per day in LOG_DIR. Written from the control thread, a
     line every window, flushed to the OS each time (no fsync: losing the
-    last few seconds in a power cut does not matter). Any I/O error switches
-    the log off with one message; it never stops the control loop."""
+    last half-minute in a power cut does not matter, and fsync every 2 s
+    would wear the SD card). Survives a cut: a half-written last line is
+    closed off on the next start and skipped by --report. Any I/O error
+    switches the log off with one message; it never stops the control
+    loop."""
 
     def __init__(self, folder):
         self.folder = Path(folder)
@@ -618,9 +641,21 @@ class CsvLog:
         self.close()
         path = self.folder / f"heater_{day}.csv"
         new = not path.exists()
+        # A power cut can leave the last line half written. Start on a
+        # fresh line so the next one is not glued to it (--report skips
+        # the broken line).
+        broken_tail = False
+        if not new:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                if f.tell() > 0:
+                    f.seek(-1, os.SEEK_END)
+                    broken_tail = f.read(1) != b"\n"
         self._f = open(path, "a", encoding="utf-8")
         if new:
             self._f.write(",".join(LOG_COLUMNS) + "\n")
+        elif broken_tail:
+            self._f.write("\n")
         # Parameters at every (re)start, so --report knows which gain a
         # stretch of log was recorded with.
         self._f.write(_log_params() + "\n")
@@ -799,7 +834,8 @@ class Heater:
                     "heater_on": self._ctl.enabled}
         try:
             save_settings(data)
-            return message
+            # Saved to RAM only: back to the card's settings at power-off.
+            return message + (" (until power-off)" if ROOT_READ_ONLY else "")
         except OSError as exc:
             print(f"  [heater] could not save settings: {exc}")
             return message + " (NOT saved)"
@@ -1018,7 +1054,8 @@ def _read_log(path):
     """[(datetime, temp or None, state, pi_w, ff_w, dose_ul, params,
     setpoint)]."""
     rows, params = [], {}
-    with open(path, "r", encoding="utf-8") as f:
+    # errors="replace": a power cut can leave garbage at the end of a log.
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("time,"):

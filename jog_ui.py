@@ -1188,6 +1188,13 @@ def main():
           f"IN1 -> {valve_mod.IN1_SETS.upper()}, "
           f"pulse {valve_mod.PULSE_S * 1000:.0f} ms "
           f"(pulse length and IN1 mapping still to be verified)")
+    if heater_mod.ROOT_READ_ONLY:
+        print("file system: READ-ONLY overlay -- settings, logs and code "
+              "changes are lost at power-off (turn it off in raspi-config "
+              "before updating)")
+    else:
+        print("file system: read-write -- shut down with 'sudo poweroff' "
+              "before cutting power")
     saved = heater_mod.load_settings()
     print(f"heater: {'SIMULATED' if heater_mod.SIMULATE else 'DS18B20 + GPIO'}, "
           f"setpoint {saved.get('setpoint_c', heater_mod.DEFAULT_SETPOINT_C)} {DEG}C, "
