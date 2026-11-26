@@ -67,18 +67,33 @@ SPI_BAUDRATE = 24000000
 MADCTL_REG = 0x36
 MADCTL_VALUE = 0x28
 
-# The panel's reset pin is not wired to a GPIO, so the HX8357D only ever gets
-# the library's SOFTWARE reset -- and adafruit_rgb_display sends the rest of
-# its setup immediately after it. The chip needs up to 120 ms after a software
-# reset when it was running (5 ms from sleep), and ignores commands sent
-# before that. When it was running -- any program restart without a power
-# cycle -- part of the setup can be lost. Losing SETPANEL (scan direction)
-# gives a left-right mirrored picture while touch stays correct (seen
-# 26 Nov 2026); only a power cycle cured it. So after the library's init we
-# wait, then send its setup again WITHOUT the reset, then MADCTL.
-RESET_SETTLE_S = 0.15
-_SWRESET = 0x01
-_SLPOUT = 0x11
+# Waits after specific start-up commands. The panel's reset pin is not wired
+# to a GPIO, so the HX8357D only gets the library's SOFTWARE reset -- and
+# adafruit_rgb_display sends its whole setup back-to-back with no waits at
+# all. The chip needs up to 120 ms after a software reset when it was running
+# (much less from a cold power-up) and ignores commands sent before that.
+# After a program restart some of the setup could therefore be lost; losing
+# SETPANEL (scan direction) gave a left-right mirrored picture with touch
+# still correct (26 Nov 2026), cured only by a power cycle. Adafruit's own
+# Arduino driver for this chip (Adafruit_HX8357.cpp, HX8357D sequence) waits
+# 100 ms after SWRESET, 500 ms after SETC and 150 ms after SLPOUT; the waits
+# here are the same, with 150 ms after the reset. Adds about 0.9 s to start-up.
+# (Sending the setup a second time without the reset instead was tried and
+# left the panel white.)
+_SWRESET, _SETC, _SLPOUT, _DISPON = 0x01, 0xB9, 0x11, 0x29
+INIT_WAITS_S = {_SWRESET: 0.15, _SETC: 0.5, _SLPOUT: 0.15, _DISPON: 0.05}
+
+
+class _HX8357(hx8357.HX8357):
+    """The library's HX8357 driver with the waits its start-up lacks. Same
+    commands, same order; the library calls init() from its constructor."""
+
+    def init(self):
+        for command, data in self._INIT:
+            self.write(command, data)
+            wait = INIT_WAITS_S.get(command)
+            if wait:
+                time.sleep(wait)
 
 
 # ---------------------------------------------------------------------------
@@ -124,31 +139,18 @@ class PiTFT:
         self.touch = Adafruit_STMPE610_SPI(spi, digitalio.DigitalInOut(board.CE1))
 
         # --- then the display ---
-        self.display = hx8357.HX8357(
+        self.display = _HX8357(
             spi,
             cs=digitalio.DigitalInOut(board.CE0),
             dc=digitalio.DigitalInOut(board.D25),
             rst=None,                      # not wired to a GPIO on the PiTFT
             baudrate=SPI_BAUDRATE,
         )
-        self._resend_setup()
         self.display.write(MADCTL_REG, bytes([MADCTL_VALUE]))
 
         # Take the size from the driver rather than hardcoding 480x320.
         self.width = self.display.width
         self.height = self.display.height
-
-    def _resend_setup(self):
-        """Send the library's setup sequence a second time, minus the
-        software reset, once the chip has certainly finished resetting (see
-        RESET_SETTLE_S). Adds about 0.3 s to start-up."""
-        time.sleep(RESET_SETTLE_S)
-        for command, data in getattr(self.display, "_INIT", ()):
-            if command == _SWRESET:
-                continue
-            self.display.write(command, data)
-            if command == _SLPOUT:
-                time.sleep(RESET_SETTLE_S)
 
     # -- drawing ------------------------------------------------------------
 
