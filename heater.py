@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Temperature control of the heater block: one DS18B20 in the block next to the
-outlet turns, and a 24 V 50 W cartridge heater in the centre of the block on
-the inlet side, switched by a logic-level MOSFET on GPIO22.
+Temperature control of the heater block, as built (Nov 2026): an aluminium
+cylinder about 60 mm in diameter and 80 mm long with 10 turns of stainless
+tube, about 1 kg in all. A 24 V 60 W cartridge heater sits in the middle at
+the top (inlet end), and one DS18B20 at the bottom (outlet end), between the
+axis and the side. The heater is switched by a logic-level MOSFET on GPIO22.
 
 WHAT RUNS WHERE
     Two background threads, so nothing here ever blocks jog_ui.py's loop:
@@ -38,15 +40,38 @@ CONTROL
 
 FEED-FORWARD
     Every dose pushed through the target line replaces V of hot liquid in the
-    coil with V of cold liquid from the syringe. jog_ui.py reports each such
-    stroke with add_dose(volume_ul), and the energy to bring that liquid to
-    the setpoint,
+    coil with V of cold liquid from the syringe. The cold liquid starts
+    taking heat out of the block the moment it enters, long before the dip
+    reaches the probe, so the heater has to start replacing that heat
+    without waiting for the probe.
+
+    jog_ui.py reports the liquid AS IT MOVES with add_dose(volume_ul): many
+    small pieces during a push, and negative pieces for liquid drawn back
+    out of the block (the pull-back after each dose). The energy to bring
+    that liquid to the setpoint,
         E = FF_GAIN * V * LIQUID_J_PER_ML_K * (setpoint - INLET_TEMP_C),
-    is delivered on top of the PI output over the next FF_SPREAD_S. Energy
-    that does not fit under HEATER_MAX_W is carried over, not lost.
+    is queued per control window and delivered on top of the PI output, at
+    a constant rate over FF_SPREAD_S from the window it came in. So for a
+    1 ml dose at 60 C the heater gets about 140 J extra -- about 4.7 W for
+    30 s -- starting within 2 s of the plunger starting to move. A pull-back
+    takes its share off what is still queued. Energy that does not fit
+    under HEATER_MAX_W is carried over, not lost.
     FF_GAIN is below 1 on purpose: under-compensating costs a small dip that
     the PI removes; over-compensating costs an overshoot that only the losses
     remove.
+
+    When the feed-forward is right, the probe shows almost nothing: in the
+    block model a 1 ml dose dips the probe by about 0.3 K without it and
+    stays within about +-0.04 K with it -- below one 0.0625 K sensor step.
+    Watch the heater power on the temperature screen, the "FF ... J" note
+    there and in the status line, or the log (below), not the tile.
+
+LOG
+    One CSV line per control window (2 s) in logs/heater_YYYY-MM-DD.csv next
+    to this file: time, probe temperature, setpoint, state, fault, PI power,
+    feed-forward power, total power, feed-forward still queued, and the
+    volume reported in that window. About 2 MB a day; files older than
+    LOG_KEEP_DAYS are deleted at start. LOG_ENABLED = False switches it off.
 
 READY
     |T - setpoint| <= STABLE_BAND_K without a break for STABLE_TIME_S.
@@ -95,22 +120,42 @@ ACCURACY
     to put the setpoint within about 0.1-0.2 K of the reference thermometer.
     It cannot by itself verify a 0.1 K requirement at the nozzle tip.
 
-TUNING (first real heat-up)
-    Log or watch the trend screen from cold to setpoint:
+TUNING
+    First real heat-up -- watch the trend screen or the log from cold:
       * Overshoot more than ~0.5 K   -> lower KP_W_PER_K (e.g. 8 -> 5).
       * Slow oscillation, period of a few minutes, that does not die out
                                      -> lower KP_W_PER_K and raise TI_S.
       * Settles below setpoint for a long time -> lower TI_S a little.
-    Then dose and watch the dip: a dip that the PI has to fill in means
-    FF_GAIN can go up; a bump above the setpoint means it should go down.
+    Feed-forward -- with the tile READY for at least 5 minutes, run 10 or
+    more INJECT cycles of the volume you normally use, about a minute
+    apart (larger volumes give a clearer signal), leave it 2 more minutes,
+    then on the Pi:
+        python3 heater.py --report
+    It prints each dose's probe excursion, the response averaged over the
+    doses, and an FF_GAIN estimate from an energy balance over the whole
+    session: feed-forward energy + the PI's extra energy compared with the
+    5 minutes before - block heat capacity x temperature change. In a
+    steady series the PI ends up supplying whatever the feed-forward
+    misses, so its extra energy is the feed-forward's error. Set FF_GAIN
+    to a little below the estimate, then, in the averaged curve:
+      * Dip that the PI fills in slowly        -> raise FF_GAIN.
+      * Bump above the setpoint                -> lower FF_GAIN.
+      * Dip first, then a bump (net about zero) -> the heat comes too late:
+                                                  shorten FF_SPREAD_S.
+      * Bump first, then a dip                 -> lengthen FF_SPREAD_S.
+    Change one thing at a time; FF_GAIN first. The DS18B20 reads in 0.0625 K
+    steps, so a single dose says little -- trust the average.
 
 BENCH TEST
     python3 heater.py
 prints the sensor reading and the controller state once a second (heater
 off unless you pass --heat).
+    python3 heater.py --report [logs/heater_YYYY-MM-DD.csv]
+analyses the doses in a log (default: the newest).
 """
 
 import atexit
+import bisect
 import glob
 import json
 import os
@@ -119,6 +164,7 @@ import time
 import traceback
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pins
@@ -141,7 +187,12 @@ SETPOINT_MAX_C = 65
 DEFAULT_SETPOINT_C = 60         # used only when there is no settings.json
 
 # -- heater -----------------------------------------------------------------
-HEATER_MAX_W = 50.0             # rated power at 24 V (power goes with V^2)
+# What the cartridge really delivers with the gate on: rated power at 24 V
+# (power goes with V^2). Every watt the controller asks for is converted to
+# on-time through this number, so it must match the heater fitted -- with
+# 50 W here and a 60 W cartridge, everything (P, I and feed-forward) came
+# out 20 % stronger than intended.
+HEATER_MAX_W = 60.0
 WINDOW_S = 2.0                  # time-proportioning window
 MIN_SWITCH_S = 0.05             # shorter on/off slivers are not switched
 
@@ -159,7 +210,19 @@ INLET_TEMP_C = 21.0             # syringe, valve and pouch are at room temp
 # KOH (density ~1.05 g/ml, cp ~3.8-3.9 J/(g K)); water is 4.18.
 LIQUID_J_PER_ML_K = 4.0
 FF_GAIN = 0.9
+# The heat each window's liquid needs is delivered over this long. About the
+# time the cold liquid takes to come to block temperature plus the time heat
+# takes to spread from the cartridge to the turns (~15 s through 30 mm of
+# aluminium).
 FF_SPREAD_S = 30.0
+# Heat capacity of the block with its tube and liquid, J/K. Used only by
+# --report to turn a temperature change into energy. Estimate for the
+# as-built block: ~0.7 kg Al x 900 + ~0.3 kg steel x 500 + ~25 ml liquid x 4.
+BLOCK_J_PER_K = 880.0
+
+# -- log --------------------------------------------------------------------
+LOG_ENABLED = True
+LOG_KEEP_DAYS = 60
 
 # -- ready ------------------------------------------------------------------
 STABLE_BAND_K = 0.15            # about +-2 sensor steps
@@ -187,6 +250,7 @@ HISTORY_S = 1800.0
 HISTORY_STEP_S = 10.0
 
 SETTINGS_FILE = Path(__file__).resolve().with_name("settings.json")
+LOG_DIR = Path(__file__).resolve().with_name("logs")
 W1_DEVICES = "/sys/bus/w1/devices"
 # ===========================================================================
 
@@ -274,14 +338,21 @@ class Controller:
 
     def _reset_loop(self):
         self._integral_w = None         # preloaded on the first update
-        self._ff_j = 0.0
-        self._ff_rate_w = 0.0
+        self._clear_ff()
+        self._dose_ul = 0.0             # volume reported since the last update
         self._band_since = None
         self._noheat = None             # (start time, start temperature)
         self.state = OFF if not self.enabled else HEATING
         self.fault = None
         self.power_w = 0.0
+        self.pi_w = 0.0
+        self.ff_w = 0.0
+        self.window_dose_ul = 0.0       # volume reported in the last window
         self.in_band_s = 0.0
+
+    def _clear_ff(self):
+        self._ff_new_j = 0.0            # reported since the last update
+        self._ff_packets = []           # [[remaining J, rate W], ...]
 
     # -- commands -----------------------------------------------------------
 
@@ -304,28 +375,48 @@ class Controller:
             self.latched = fault
 
     def add_dose(self, volume_ul):
-        """Queue the energy for one dose. Returns the energy in J (0 if the
+        """Report liquid moved through the target line, in ul: positive for
+        liquid pushed into the block, negative for liquid drawn back out of
+        it. May be called many times per stroke with small pieces. Returns
+        the energy queued in J (negative: taken off the queue; 0 if the
         heater is off or faulted)."""
+        self._dose_ul += volume_ul
         if not self.enabled or self.latched or self.state == FAULT:
             return 0.0
         dt_k = max(0.0, self.setpoint_c - INLET_TEMP_C)
         energy = FF_GAIN * (volume_ul / 1000.0) * LIQUID_J_PER_ML_K * dt_k
-        self._ff_j += energy
-        # Everything still queued is spread over the next FF_SPREAD_S.
-        self._ff_rate_w = self._ff_j / FF_SPREAD_S
-        return energy
+        if energy >= 0.0:
+            self._ff_new_j += energy
+            return energy
+        # Liquid drawn back out: take its energy off what is still queued,
+        # newest first. Never below zero -- heat already delivered stays.
+        take = -energy
+        removed = min(take, self._ff_new_j)
+        self._ff_new_j -= removed
+        take -= removed
+        for packet in reversed(self._ff_packets):
+            if take <= 0.0:
+                break
+            r = min(take, packet[0])
+            packet[0] -= r
+            take -= r
+            removed += r
+        self._ff_packets = [p for p in self._ff_packets if p[0] > 1e-6]
+        return -removed
 
     @property
     def ff_pending_j(self):
-        return self._ff_j
+        return self._ff_new_j + sum(p[0] for p in self._ff_packets)
 
     # -- the update ---------------------------------------------------------
 
     def update(self, now, temp_c, dt):
+        self.window_dose_ul, self._dose_ul = self._dose_ul, 0.0
+        self.pi_w = self.ff_w = 0.0
         if not self.enabled:
             self.state, self.fault = OFF, None
             self.power_w = 0.0
-            self._ff_j = 0.0
+            self._clear_ff()
             self.in_band_s = 0.0
             return 0.0
 
@@ -351,18 +442,28 @@ class Controller:
                 0.0, HEATER_MAX_W)
         pi_w = _clamp(KP_W_PER_K * err + self._integral_w, 0.0, HEATER_MAX_W)
 
+        # Feed-forward: what came in since the last window becomes one
+        # packet, delivered at a constant rate over FF_SPREAD_S. Packets
+        # overlap when doses follow closely; the rates then add up.
+        if self._ff_new_j > 0.0:
+            self._ff_packets.append([self._ff_new_j,
+                                     self._ff_new_j / FF_SPREAD_S])
+            self._ff_new_j = 0.0
         ff_w = 0.0
-        if self._ff_j > 0.0:
-            ff_w = max(0.0, min(self._ff_rate_w, HEATER_MAX_W - pi_w,
-                                self._ff_j / dt))
-            self._ff_j -= ff_w * dt
-            if self._ff_j < 1e-6:
-                self._ff_j = 0.0
+        if self._ff_packets:
+            want = [min(rate, left / dt) for left, rate in self._ff_packets]
+            total = sum(want)
+            ff_w = max(0.0, min(total, HEATER_MAX_W - pi_w))
+            scale = ff_w / total if total > 0.0 else 0.0
+            for packet, w in zip(self._ff_packets, want):
+                packet[0] -= w * scale * dt
+            self._ff_packets = [p for p in self._ff_packets if p[0] > 1e-6]
 
         # No-heat check: the PI has been asking for most of full power for a
         # long time and the block has hardly warmed. Only while no dose is
         # being compensated, so a cold dose cannot be mistaken for it.
-        if pi_w >= NO_HEAT_POWER_FRAC * HEATER_MAX_W and self._ff_j == 0.0:
+        if (pi_w >= NO_HEAT_POWER_FRAC * HEATER_MAX_W
+                and self.ff_pending_j == 0.0):
             if self._noheat is None:
                 self._noheat = (now, temp_c)
             elif now - self._noheat[0] >= NO_HEAT_S:
@@ -386,13 +487,14 @@ class Controller:
         else:
             self.state = HEATING if err > 0 else COOLING
         self.fault = None
+        self.pi_w, self.ff_w = pi_w, ff_w
         self.power_w = pi_w + ff_w
         return self.power_w
 
     def _faulted(self, fault):
         self.state, self.fault = FAULT, fault
         self.power_w = 0.0
-        self._ff_j = 0.0
+        self._clear_ff()
         self._band_since = None
         self._noheat = None
         self.in_band_s = 0.0
@@ -408,15 +510,16 @@ class Controller:
 class SimBlock:
     """Two-node lumped model of an insulated aluminium heater block.
 
-    H: the inlet half with the heater; O: the outlet half with the probe.
-    A dose's cold liquid lands in the inlet turns, so most of its heat is
-    drawn from H. The probe has its own first-order lag and reads in
-    0.0625 K steps. The numbers are estimates for the HX1 block (1.4 kg Al,
-    3.1 m of 6x1 steel tube, PIR insulation), not measurements."""
+    H: the top (inlet) half with the heater; O: the bottom (outlet) half
+    with the probe. A dose's cold liquid lands in the inlet turns, so most of
+    its heat is drawn from H. The probe has its own first-order lag and reads
+    in 0.0625 K steps. The numbers are estimates for the as-built block
+    (Al cylinder ~60 x 80 mm with 10 turns of 6 x 1 steel tube, ~1 kg),
+    not measurements."""
 
-    C_H = 800.0             # J/K
-    C_O = 830.0             # J/K
-    G_HO = 25.0             # W/K between the halves
+    C_H = 440.0             # J/K
+    C_O = 440.0             # J/K
+    G_HO = 12.0             # W/K: 6082 through a 60 mm disc over 40 mm
     G_AMB = 0.03            # W/K from each half to the room
     TAU_PROBE_S = 20.0
     DOSE_FRACTION_H = 0.9
@@ -429,15 +532,24 @@ class SimBlock:
         self.ambient = ambient_c
         self.t_h = self.t_o = self.t_probe = start_c
         self._sinks = []        # [remaining J, rate W]
+        self._incoming_j = 0.0  # reported since the last step
         self.heater_ok = True   # False simulates a tripped cutout
 
     def add_dose(self, volume_ul):
-        energy = (volume_ul / 1000.0) * LIQUID_J_PER_ML_K * (self.t_h - INLET_TEMP_C)
-        if energy > 0:
-            self._sinks.append([energy, energy / self.DOSE_SPREAD_S])
+        """Liquid entering (or, negative, leaving) the block. Called in
+        small pieces as the plunger moves, like the controller's."""
+        self._incoming_j += ((volume_ul / 1000.0) * LIQUID_J_PER_ML_K
+                             * (self.t_h - INLET_TEMP_C))
 
     def step(self, dt, heater_w):
         heater_w = heater_w if self.heater_ok else 0.0
+        if self._incoming_j > 0:
+            self._sinks.append([self._incoming_j,
+                                self._incoming_j / self.DOSE_SPREAD_S])
+        elif self._incoming_j < 0 and self._sinks:
+            # Drawn back before it had taken up its heat.
+            self._sinks[-1][0] = max(0.0, self._sinks[-1][0] + self._incoming_j)
+        self._incoming_j = 0.0
         t = 0.0
         while t < dt - 1e-9:
             h = min(self.STEP_S, dt - t)
@@ -460,6 +572,94 @@ class SimBlock:
 
 
 # ---------------------------------------------------------------------------
+# Log, for tuning
+# ---------------------------------------------------------------------------
+
+LOG_COLUMNS = ("time", "temp_c", "setpoint_c", "state", "fault", "pi_w",
+               "ff_w", "power_w", "ff_pending_j", "dose_ul")
+
+
+def _log_params():
+    return (f"# FF_GAIN={FF_GAIN:g} FF_SPREAD_S={FF_SPREAD_S:g} "
+            f"HEATER_MAX_W={HEATER_MAX_W:g} KP_W_PER_K={KP_W_PER_K:g} "
+            f"TI_S={TI_S:g} INLET_TEMP_C={INLET_TEMP_C:g} "
+            f"LIQUID_J_PER_ML_K={LIQUID_J_PER_ML_K:g}")
+
+
+class CsvLog:
+    """One CSV file per day in LOG_DIR. Written from the control thread, a
+    line every window, flushed to the OS each time (no fsync: losing the
+    last few seconds in a power cut does not matter). Any I/O error switches
+    the log off with one message; it never stops the control loop."""
+
+    def __init__(self, folder):
+        self.folder = Path(folder)
+        self._f = None
+        self._day = None
+        self.failed = False
+        try:
+            self.folder.mkdir(exist_ok=True)
+            self._prune()
+        except OSError as exc:
+            self._fail(exc)
+
+    def _prune(self):
+        cutoff = (datetime.now() - timedelta(days=LOG_KEEP_DAYS)).strftime("%Y-%m-%d")
+        for p in self.folder.glob("heater_????-??-??.csv"):
+            if p.stem[len("heater_"):] < cutoff:
+                p.unlink()
+
+    def _open(self, day):
+        self.close()
+        path = self.folder / f"heater_{day}.csv"
+        new = not path.exists()
+        self._f = open(path, "a", encoding="utf-8")
+        if new:
+            self._f.write(",".join(LOG_COLUMNS) + "\n")
+        # Parameters at every (re)start, so --report knows which gain a
+        # stretch of log was recorded with.
+        self._f.write(_log_params() + "\n")
+        self._day = day
+
+    @staticmethod
+    def row(now, temp_c, ctl):
+        """(day, line) for one window. Cheap, no I/O: called under the
+        heater's lock."""
+        temp = "" if temp_c is None else f"{temp_c:.4f}"
+        line = (f"{now:%Y-%m-%d %H:%M:%S}.{now.microsecond // 100000},"
+                f"{temp},{ctl.setpoint_c},{ctl.state},{ctl.fault or ''},"
+                f"{ctl.pi_w:.2f},{ctl.ff_w:.2f},{ctl.power_w:.2f},"
+                f"{ctl.ff_pending_j:.1f},{ctl.window_dose_ul:.1f}\n")
+        return now.strftime("%Y-%m-%d"), line
+
+    def write(self, row):
+        if self.failed:
+            return
+        day, line = row
+        try:
+            if day != self._day:
+                self._open(day)
+            self._f.write(line)
+            self._f.flush()
+        except OSError as exc:
+            self._fail(exc)
+
+    def _fail(self, exc):
+        print(f"  [heater] log switched off: {exc}")
+        self.failed = True
+        self.close()
+
+    def close(self):
+        if self._f is not None:
+            try:
+                self._f.close()
+            except OSError:
+                pass
+            self._f = None
+            self._day = None
+
+
+# ---------------------------------------------------------------------------
 # The heater
 # ---------------------------------------------------------------------------
 
@@ -472,8 +672,9 @@ class Snapshot:
     fault: object           # str, or None
     power_frac: float
     in_band_s: float
-    ff_pending_j: float
+    ff_pending_j: float     # feed-forward energy still to deliver, J
     history_version: int
+    ff_w: float = 0.0       # feed-forward part of the present power, W
 
 
 class Heater:
@@ -506,6 +707,8 @@ class Heater:
         self._history = deque(maxlen=int(HISTORY_S / HISTORY_STEP_S))
         self._history_version = 0
         self._next_history = 0.0
+
+        self._log = CsvLog(LOG_DIR) if LOG_ENABLED else None
 
         self._gate = None
         self._gate_on = False
@@ -540,6 +743,8 @@ class Heater:
             th.join(timeout=WINDOW_S + 1.5)
         self._threads = []
         self._set_gate(False)
+        if self._log is not None:
+            self._log.close()
         if self._gate is not None:
             try:
                 self._gate.deinit()
@@ -573,14 +778,14 @@ class Heater:
         return self._save(f"heating to {sp} \u00b0C" if enabled else "heater off")
 
     def add_dose(self, volume_ul):
-        """Report liquid pushed through the target line. Returns the
-        feed-forward energy queued, in J."""
+        """Report liquid moved through the target line as it moves: positive
+        into the block, negative back out of it. Called many times per
+        stroke, so it prints nothing; jog_ui.py prints a summary per cycle.
+        Returns the feed-forward energy queued (negative: removed), in J."""
         with self._lock:
             energy = self._ctl.add_dose(volume_ul)
             if self._sim is not None:
                 self._sim.add_dose(volume_ul)
-        if self.verbose and energy:
-            print(f"  [heater] dose {volume_ul:.0f} ul -> feed-forward {energy:.0f} J")
         return energy
 
     def _save(self, message):
@@ -611,7 +816,8 @@ class Heater:
                 power_frac=ctl.power_w / HEATER_MAX_W,
                 in_band_s=ctl.in_band_s,
                 ff_pending_j=ctl.ff_pending_j,
-                history_version=self._history_version)
+                history_version=self._history_version,
+                ff_w=ctl.ff_w)
 
     def history(self):
         """[(monotonic time, temperature C), ...], oldest first, one point
@@ -729,6 +935,13 @@ class Heater:
                         self._next_history = now + HISTORY_STEP_S
                         self._history.append((now, temp))
                         self._history_version += 1
+                    # Captured under the lock, written outside it: a slow SD
+                    # card must never hold up snapshot() in the UI loop,
+                    # which keeps the Tic's command timeout fed.
+                    log_row = (None if self._log is None
+                               else self._log.row(datetime.now(), temp, self._ctl))
+                if log_row is not None:
+                    self._log.write(log_row)
 
                 on_s = power / HEATER_MAX_W * WINDOW_S
                 if on_s < MIN_SWITCH_S:
@@ -792,6 +1005,194 @@ def bench_test(heat=False):
         h.close()
 
 
+# ---------------------------------------------------------------------------
+# Feed-forward report from a log
+# ---------------------------------------------------------------------------
+
+def _read_log(path):
+    """[(datetime, temp or None, state, pi_w, ff_w, dose_ul, params,
+    setpoint)]."""
+    rows, params = [], {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("time,"):
+                continue
+            if line.startswith("#"):
+                params = dict(kv.split("=", 1) for kv in line[1:].split() if "=" in kv)
+                continue
+            parts = line.split(",")
+            if len(parts) != len(LOG_COLUMNS):
+                continue
+            try:
+                ts = datetime.strptime(parts[0], "%Y-%m-%d %H:%M:%S.%f")
+                temp = float(parts[1]) if parts[1] else None
+                rows.append((ts, temp, parts[3], float(parts[5]),
+                             float(parts[6]), float(parts[9]), params,
+                             float(parts[2])))
+            except ValueError:
+                continue
+    return rows
+
+
+def _ff_queued(row, vol):
+    """(FF_GAIN, feed-forward energy queued for vol ul) with the parameters
+    the log line was recorded with."""
+    p = row[6]
+    gain = float(p.get("FF_GAIN", FF_GAIN))
+    cp = float(p.get("LIQUID_J_PER_ML_K", LIQUID_J_PER_ML_K))
+    t_in = float(p.get("INLET_TEMP_C", INLET_TEMP_C))
+    return gain, gain * vol / 1000.0 * cp * max(0.0, row[7] - t_in)
+
+
+def report(path=None, idle_s=300.0, tail_s=120.0, base_s=30.0, gap_s=300.0):
+    """Analyse the doses in a log.
+
+    Per dose: the probe's lowest and highest point relative to the base_s
+    before the dose, and that response averaged over all doses -- its shape
+    tells gain from timing (see TUNING).
+
+    Per session (doses at most gap_s apart, at least 3 of them): an energy
+    balance against the idle_s of steady regulation before the first dose,
+    up to tail_s after the last one:
+        heat the doses took = feed-forward energy delivered
+                            + (PI power - PI power before) x time
+                            - BLOCK_J_PER_K x (temperature after - before)
+    In a steady series of doses the PI ends up supplying whatever the
+    feed-forward misses, so its extra energy over the session is the
+    feed-forward's error. FF_GAIN estimate = FF_GAIN x heat taken / FF
+    energy queued.
+    """
+    if path is None:
+        files = sorted(LOG_DIR.glob("heater_????-??-??.csv"))
+        if not files:
+            print(f"no logs in {LOG_DIR}")
+            return
+        path = files[-1]
+    rows = _read_log(path)
+    if not rows:
+        print(f"{path}: no data")
+        return
+    t0 = rows[0][0]
+    ts = [(r[0] - t0).total_seconds() for r in rows]
+
+    def span(a, b):
+        """Row indices with a <= t < b."""
+        return range(bisect.bisect_left(ts, a), bisect.bisect_left(ts, b))
+
+    # Doses: runs of windows with reported volume, gaps of at most 6 s.
+    # [first row, last row, net volume]; the volume came in during the
+    # window before each row, so a dose starts WINDOW_S before its first row.
+    events, cur = [], None
+    for i, r in enumerate(rows):
+        if r[5] != 0.0:
+            if cur is not None and ts[i] - ts[cur[1]] <= 6.0:
+                cur[1] = i
+                cur[2] += r[5]
+            else:
+                cur = [i, i, r[5]]
+                events.append(cur)
+    events = [e for e in events if e[2] > 0.0]
+    print(f"{path}: {len(events)} doses")
+    if not events:
+        return
+    starts = [ts[e[0]] - WINDOW_S for e in events]
+
+    # -- per dose -----------------------------------------------------------
+    bins = list(range(0, 130, 10))
+    curves = []
+    print(" time      volume   FF J    lowest       highest    "
+          "(probe against the 30 s before)")
+    for k, (i0, i1, vol) in enumerate(events):
+        start = starts[k]
+        end = min(start + bins[-1] + 10, starts[k + 1] if k + 1 < len(events)
+                  else float("inf"))
+        base, win = span(start - base_s, start), span(start, end)
+        if (len(base) < 0.8 * base_s / WINDOW_S
+                or any(rows[j][1] is None for j in list(base) + list(win))):
+            continue
+        b_t = sum(rows[j][1] for j in base) / len(base)
+        devs = [(ts[j] - start, rows[j][1] - b_t) for j in win]
+        lo = min(devs, key=lambda d: d[1])
+        hi = max(devs, key=lambda d: d[1])
+        print(f" {rows[i0][0]:%H:%M:%S} {vol:6.0f} ul {_ff_queued(rows[i0], vol)[1]:5.0f}"
+              f"   {lo[1]:+.3f} {lo[0]:3.0f}s   {hi[1]:+.3f} {hi[0]:3.0f}s")
+        curve = {}
+        for d_t, dev in devs:
+            curve.setdefault(int(d_t // 10) * 10, []).append(dev)
+        curves.append({b: sum(v) / len(v) for b, v in curve.items()})
+    if curves:
+        print(f"averaged probe deviation after the dose ({len(curves)} doses), K:")
+        cells = []
+        for b in bins:
+            # Only as far as most doses reach before the next one starts.
+            vals = [c[b] for c in curves if b in c]
+            if len(vals) >= max(1, len(curves) // 2):
+                cells.append(f"{b:3d}s {sum(vals) / len(vals):+.3f}")
+        for n in range(0, len(cells), 5):
+            print("   " + "   ".join(cells[n:n + 5]))
+
+    # -- per session --------------------------------------------------------
+    sessions, cur = [], None
+    for k in range(len(events)):
+        if cur is not None and starts[k] - starts[cur[-1]] <= gap_s:
+            cur.append(k)
+        else:
+            cur = [k]
+            sessions.append(cur)
+    for sess in sessions:
+        s0, s1 = starts[sess[0]], starts[sess[-1]] + tail_s
+        head = f"session {rows[events[sess[0]][0]][0]:%H:%M}, {len(sess)} doses:"
+        if len(sess) < 3:
+            print(f"{head} too few for an energy balance (3 or more)")
+            continue
+        idle, run = span(s0 - idle_s, s0), span(s0, s1)
+        if (len(idle) < 0.8 * idle_s / WINDOW_S
+                or any(rows[j][1] is None or rows[j][5] != 0.0
+                       or rows[j][2] not in (READY, SETTLING) for j in idle)):
+            print(f"{head} needs {idle_s / 60:.0f} min of steady regulation "
+                  f"(READY/SETTLING, no doses) before the first dose")
+            continue
+        if ts[-1] < s1 - WINDOW_S or any(rows[j][1] is None or rows[j][2] == FAULT
+                                         for j in run):
+            print(f"{head} needs {tail_s:.0f} s of log after the last dose, "
+                  f"without faults or sensor gaps")
+            continue
+        p_idle = sum(rows[j][3] for j in idle) / len(idle)
+        t_before = sum(rows[j][1] for j in span(s0 - 60.0, s0)) / len(span(s0 - 60.0, s0))
+        t_after = sum(rows[j][1] for j in span(s1 - 30.0, s1)) / len(span(s1 - 30.0, s1))
+        e_pi = sum((rows[j][3] - p_idle) * WINDOW_S for j in run)
+        e_ff = sum(rows[j][4] * WINDOW_S for j in run)
+        queued = [_ff_queued(rows[events[k][0]], events[k][2]) for k in sess]
+        gain = queued[-1][0]
+        e_q = sum(q[1] for q in queued)
+        e_block = BLOCK_J_PER_K * (t_after - t_before)
+        e_took = e_ff + e_pi - e_block
+        vol = sum(events[k][2] for k in sess)
+        dt_k = rows[events[sess[0]][0]][7] - float(rows[events[sess[0]][0]][6].get(
+            "INLET_TEMP_C", INLET_TEMP_C))
+        print(head)
+        print(f"   feed-forward {e_ff:.0f} J delivered ({e_q:.0f} J queued)")
+        print(f"   PI {p_idle:.2f} W before, {e_pi / (s1 - s0):+.2f} W while dosing "
+              f"-> {e_pi:+.0f} J; block {t_after - t_before:+.3f} K -> {e_block:+.0f} J")
+        if e_q > 1.0 and dt_k > 0:
+            print(f"   heat the doses took {e_took:.0f} J = "
+                  f"{e_took / (vol / 1000.0) / dt_k:.2f} J/(ml K) of liquid "
+                  f"(LIQUID_J_PER_ML_K = {LIQUID_J_PER_ML_K:g})")
+            print(f"   FF_GAIN estimate {gain * e_took / e_q:.2f} (recorded with "
+                  f"{gain:g}). Rests on BLOCK_J_PER_K = {BLOCK_J_PER_K:g} and "
+                  f"HEATER_MAX_W matching the cartridge.")
+            if abs(e_ff - e_q) > 0.05 * e_q:
+                print("   NOTE: delivered and queued differ by more than 5 % "
+                      "(heater at full power, or the heater was switched off)")
+        else:
+            print("   no feed-forward queued (heater off?)")
+
+
 if __name__ == "__main__":
     import sys
-    bench_test(heat="--heat" in sys.argv)
+    if "--report" in sys.argv:
+        rest = sys.argv[sys.argv.index("--report") + 1:]
+        report(rest[0] if rest else None)
+    else:
+        bench_test(heat="--heat" in sys.argv)

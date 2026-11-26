@@ -7,8 +7,8 @@ Touchscreen syringe-dispenser interface, three screens.
                  position it will switch TO.
 
     OPERATION    routine use: keypad and a single INJECT button that runs the
-                 full cycle -- valve to target, push, valve to refill, pull,
-                 valve back to rest.
+                 full cycle -- valve to target, push, short pull-back, valve
+                 to refill, pull, valve back to rest.
 
     TEMPERATURE  opened by tapping the temperature tile: keypad for the
                  setpoint in whole degrees, SET (applies, saves and switches
@@ -29,14 +29,38 @@ Heater rules:
       greys out). Set REQUIRE_READY_TO_INJECT = True to also refuse it until
       the tile is green. A heater that is switched OFF is not a fault: dosing
       at room temperature stays possible.
-    * Every stroke that pushes liquid through the target line -- an INJECT
-      cycle, a manual PUSH with the valve on TARGET, or either of them stopped
-      partway -- is reported to the heater with the volume actually moved, for
-      the feed-forward (see heater.py).
+    * Liquid moved through the target line is reported to the heater AS IT
+      MOVES, for the feed-forward (see heater.py): an INJECT cycle, a manual
+      PUSH with the valve on TARGET, either of them stopped partway, and --
+      as negative volume -- the pull-back or a manual PULL on TARGET. The
+      heater starts replacing the heat within one control window (2 s) of
+      the plunger starting to move, instead of after the stroke.
+    * After each INJECT the status line shows the feed-forward energy, e.g.
+      "done: 1000 µl, FF 140 J", and the temperature screen shows what is
+      still queued ("FF 95 J"). "FF 0 J" with the heater on means the
+      feed-forward did not run.
     * The setpoint and on/off state are saved in settings.json and restored at
       the next start, so the block starts heating as soon as the program runs.
       Heating stops when the program stops: for overnight equilibration leave
       it running (in tmux, or as a systemd service).
+
+Pull-back (INJECT only):
+    Each dose enters the block cold and expands by about 1.5 % as it warms
+    from room temperature to 60 C. Much of that happens after the push has
+    stopped, which pushes a drop out of the nozzle. So after the push
+    (and PULLBACK_DELAY_S for the after-flow to stop) the plunger draws back,
+    with the valve still on TARGET,
+        KOH_EXPANSION_VS_WATER x (expansion of water from INLET_TEMP_C to the
+        block temperature) x dose + PULLBACK_MARGIN_UL,
+    i.e. a little more than the dose can expand. For 1000 ul at 60 C that is
+    about 22 ul. The meniscus then sits that far inside the tip, and the
+    expansion brings it back towards the tip without reaching it.
+    With PULLBACK_COMPENSATE the push is made longer by the same amount, so
+    the plunger's net travel towards the nozzle -- the dose -- is still the
+    entered volume, and the refill pull is exactly the entered volume. The
+    next push first expels the small air gap. The FIRST dose after priming
+    (tip full) therefore delivers the pull-back volume extra -- one more
+    reason to purge the first dose of a session.
 
 Valve rules (see valves.py for the valve itself):
     * The valve is only switched while the plunger is still. Switching while
@@ -103,9 +127,41 @@ SETUP_BUTTON_ABORTS_CYCLE = True
 # False: INJECT is refused only on a heater fault. True: also until READY.
 REQUIRE_READY_TO_INJECT = False
 
-# Strokes through the target line smaller than this are not reported to the
-# heater (rounding noise, a nudge while priming).
-MIN_DOSE_FOR_FF_UL = 5.0
+# -- pull-back after each INJECT push (see the module docstring) -------------
+PULLBACK_ENABLED = True
+# Margin on top of the estimated expansion.
+PULLBACK_MARGIN_UL = 5.0
+# 1 M KOH (+ K2SO4) against water. Its expansion from ~20 to 60 C has not
+# been looked up; electrolyte solutions of this strength expand about as
+# much as water over this range, so 1.1 covers it with some room. Measure:
+# fill the coil, note the tip meniscus, heat, see how far it moves.
+KOH_EXPANSION_VS_WATER = 1.1
+# Wait after the push before pulling back, so the after-flow from the
+# syringe and tubing has stopped. Shorter than actuator.py's hold time, so
+# the motor stays energised through it.
+PULLBACK_DELAY_S = 0.3
+# Push dose + pull-back, so the net dose is the entered volume.
+PULLBACK_COMPENSATE = True
+
+
+def water_density(t_c):
+    """kg/m^3, Kell (1975), 0-150 C. 998.20 at 20 C, 983.20 at 60 C."""
+    t = t_c
+    return ((999.83952 + 16.945176 * t - 7.9870401e-3 * t ** 2
+             - 46.170461e-6 * t ** 3 + 105.56302e-9 * t ** 4
+             - 280.54253e-12 * t ** 5) / (1.0 + 16.879850e-3 * t))
+
+
+def pullback_ul(volume_ul, block_c):
+    """Pull-back volume for a dose of volume_ul in a block at block_c: a
+    little more than the dose expands from inlet to block temperature.
+    Without a block temperature (no sensor) the setpoint is used by the
+    caller; with the block at room temperature only the margin is left."""
+    cold = heater_mod.INLET_TEMP_C
+    frac = 0.0
+    if block_c is not None and block_c > cold:
+        frac = water_density(cold) / water_density(block_c) - 1.0
+    return KOH_EXPANSION_VS_WATER * frac * volume_ul + PULLBACK_MARGIN_UL
 
 
 # ---------------------------------------------------------------------------
@@ -218,26 +274,35 @@ class InjectCycle:
 
     Steps:
         1. valve to TARGET (syringe -> heater block and nozzle), settle
-        2. push the entered volume forward
-        3. valve to REFILL (syringe -> pouch), settle
-        4. pull the same volume back
-        5. valve back to rest, settle
+        2. push the entered volume (+ the pull-back, see PULLBACK_COMPENSATE)
+        3. hold PULLBACK_DELAY_S, then pull back the pull-back volume with
+           the valve still on TARGET
+        4. valve to REFILL (syringe -> pouch), settle
+        5. pull back to the start position (= the entered volume)
+        6. valve back to rest, settle
+
+    Every stroke goes to an absolute position worked out from where the
+    cycle started, so rounding to microsteps cannot make the plunger creep
+    from one cycle to the next.
 
     The valve is only ever switched while the plunger is still. That is also
     why abort() does not move the valve at once: it stops the actuator, waits
     in ABORTING until the plunger has actually stopped, and only then sends
     the valve to rest.
 
-    The heater's feed-forward is not triggered from here: JogUI reports every
-    stroke through the target line, from whichever source, once it has ended.
+    The heater's feed-forward is not triggered from here: JogUI reports all
+    liquid moved through the target line, from whichever source, as it
+    moves.
 
-    Later additions (the HX1 post-dose pull-back ramp with the valve still at
-    TARGET, purge doses) slot in as extra states between PUSH and TO_REFILL.
+    Later additions (purge doses) slot in as extra states between PULLBACK
+    and TO_REFILL.
     """
 
     IDLE = "idle"
     TO_TARGET = "valve to target"
     PUSH = "pushing"
+    HOLD = "holding"
+    PULLBACK = "pulling back"
     TO_REFILL = "valve to refill"
     PULL = "drawing up"
     TO_REST = "valve to rest"
@@ -252,6 +317,9 @@ class InjectCycle:
         self.message = ""
         self._deadline = 0.0
         self._volume_ul = 0
+        self.pullback_ul = 0.0
+        self.push_ul = 0.0
+        self._start_mm = 0.0
 
     @property
     def running(self):
@@ -261,7 +329,9 @@ class InjectCycle:
     def aborting(self):
         return self.state == self.ABORTING
 
-    def start(self, volume_ul):
+    def start(self, volume_ul, block_c=None):
+        """block_c: block temperature for the pull-back estimate, C (None:
+        no expansion assumed, margin only)."""
         if self.running:
             return False, "cycle already running"
         if not self.act.homed:
@@ -272,9 +342,16 @@ class InjectCycle:
             return False, "volume must be > 0"
 
         self._volume_ul = volume_ul
+        self.pullback_ul = pullback_ul(volume_ul, block_c) if PULLBACK_ENABLED else 0.0
+        self.push_ul = volume_ul + (self.pullback_ul if PULLBACK_COMPENSATE else 0.0)
+        self._start_mm = self.act.position_mm
         self._switch_valve(TARGET, self.TO_TARGET)
         self.message = f"cycle: {volume_ul} {MICRO}l"
         return True, self.message
+
+    def _at(self, ul):
+        """Absolute plunger position ul towards the nozzle from the start."""
+        return self._start_mm + PUSH_SIGN * ul * MM_PER_UL
 
     def abort(self, reason="aborted"):
         """Stop the plunger now; the valve follows once it has stopped."""
@@ -307,19 +384,31 @@ class InjectCycle:
             return self.state
 
         now = time.monotonic()
-        mm = self._volume_ul * MM_PER_UL
 
         if self.state == self.TO_TARGET:
             if now >= self._deadline:
-                self._start_stroke(PUSH_SIGN * mm, self.PUSH, "push")
+                self._start_stroke(self._at(self.push_ul), self.PUSH, "push")
 
         elif self.state == self.PUSH:
+            if not self.act.busy:
+                if self.pullback_ul > 0.0:
+                    self._deadline = now + PULLBACK_DELAY_S
+                    self.state = self.HOLD
+                else:
+                    self._switch_valve(REFILL, self.TO_REFILL)
+
+        elif self.state == self.HOLD:
+            if now >= self._deadline:
+                self._start_stroke(self._at(self.push_ul - self.pullback_ul),
+                                   self.PULLBACK, "pull-back")
+
+        elif self.state == self.PULLBACK:
             if not self.act.busy:
                 self._switch_valve(REFILL, self.TO_REFILL)
 
         elif self.state == self.TO_REFILL:
             if now >= self._deadline:
-                self._start_stroke(-PUSH_SIGN * mm, self.PULL, "pull")
+                self._start_stroke(self._start_mm, self.PULL, "pull")
 
         elif self.state == self.PULL:
             if not self.act.busy:
@@ -341,8 +430,8 @@ class InjectCycle:
         self._deadline = time.monotonic() + valve_mod.VALVE_SETTLE_S
         self.state = next_state
 
-    def _start_stroke(self, delta_mm, next_state, name):
-        ok, msg = self.act.start_move_relative(delta_mm)
+    def _start_stroke(self, target_mm, next_state, name):
+        ok, msg = self.act.start_move_to(target_mm)
         if ok:
             self.state = next_state
         else:
@@ -408,9 +497,11 @@ class JogUI:
         # Set when a homing run has moved the valve to REFILL; the main loop
         # returns it to rest once the plunger has stopped.
         self._valve_back_to_rest = False
-        # Stroke bookkeeping for the heater's feed-forward: see _track_dose().
-        self._idle_pos_mm = None
-        self._stroke = None
+        # Bookkeeping for the heater's feed-forward: see _track_dose().
+        self._ff_pos_mm = None          # position at the previous loop
+        self._ff_line = None            # valve position at the previous loop
+        self._ff_trusted = False        # position trusted at the previous loop
+        self._cycle_ff_j = 0.0          # feed-forward energy queued this cycle
 
     # -- layout -------------------------------------------------------------
 
@@ -549,7 +640,9 @@ class JogUI:
                 cols.append((100, "heater off"))
             else:
                 cols.append((100, f"heater {snap.power_frac * 100:3.0f} %"))
-                if snap.in_band_s > 0:
+                if snap.ff_pending_j >= 1.0:
+                    cols.append((212, f"FF {snap.ff_pending_j:.0f} J"))
+                elif snap.in_band_s > 0:
                     m, s = divmod(int(snap.in_band_s), 60)
                     cols.append((212, f"in band {m}:{s:02d}"))
                 elif snap.temp_c is not None:
@@ -743,33 +836,43 @@ class JogUI:
     # -- feed-forward bookkeeping ---------------------------------------------
 
     def _track_dose(self, pos):
-        """Report every stroke that pushed liquid through the target line to
-        the heater, with the volume it actually moved.
+        """Report liquid moved through the target line to the heater while
+        it moves, once per loop iteration: positive towards the nozzle,
+        negative back out of the block.
 
         Watches the actuator rather than the cycle, so an INJECT cycle, a
-        manual PUSH with the valve on TARGET, and either of them stopped
-        partway are all covered. Pulls, homing (valve on REFILL, and the
-        position is re-zeroed) and pushes back into the pouch are not. The
-        valve cannot change during a stroke, so its position on the first
-        busy iteration is the stroke's line; the start position is the last
-        reading while the plunger was still."""
-        if self.act.busy:
-            if self._stroke is None:
-                self._stroke = {"start_mm": self._idle_pos_mm,
-                                "valve": self.valves.position,
-                                "homing": False}
-            if self.act.state == HOMING:
-                self._stroke["homing"] = True
-            return
+        manual PUSH or PULL with the valve on TARGET, and any of them
+        stopped partway are all covered. Moves on REFILL, and homing (the
+        position is re-zeroed), are not.
 
-        s, self._stroke = self._stroke, None
-        self._idle_pos_mm = pos
-        if (s is None or s["homing"] or s["valve"] != TARGET
-                or s["start_mm"] is None or not self.act.homed):
+        The movement since the previous iteration is charged to the valve
+        position recorded at the previous iteration. The valve is never
+        switched while the plunger moves, so that is the line the liquid
+        went through -- even on the iteration where the cycle has just
+        switched the valve to REFILL at the end of the push."""
+        trusted = self.act.homed and self.act.state != HOMING
+        last, line, was_trusted = self._ff_pos_mm, self._ff_line, self._ff_trusted
+        self._ff_pos_mm = pos
+        self._ff_line = self.valves.position
+        self._ff_trusted = trusted
+        if last is None or not (trusted and was_trusted) or line != TARGET:
             return
-        moved_ul = PUSH_SIGN * (pos - s["start_mm"]) / MM_PER_UL
-        if moved_ul >= MIN_DOSE_FOR_FF_UL:
-            self.heater.add_dose(moved_ul)
+        moved_ul = PUSH_SIGN * (pos - last) / MM_PER_UL
+        if moved_ul:
+            self._cycle_ff_j += self.heater.add_dose(moved_ul)
+
+    def _cycle_summary(self):
+        """Status line at the end of an INJECT cycle, and a console line
+        with the details."""
+        c = self.cycle
+        msg = c.message
+        if c.state == InjectCycle.DONE:
+            msg += (f", FF {self._cycle_ff_j:.0f} J" if self.heater.enabled
+                    else " (heater off)")
+        print(f"  [cycle] {c.message}: pushed {c.push_ul:.1f} {MICRO}l, "
+              f"pull-back {c.pullback_ul:.1f} {MICRO}l, "
+              f"feed-forward {self._cycle_ff_j:.0f} J")
+        return msg
 
     # -- input --------------------------------------------------------------
 
@@ -893,11 +996,18 @@ class JogUI:
             if not self.entry:
                 self.status = "no volume set"
                 return
-            refusal = self._inject_refusal(self.heater.snapshot())
+            snap = self.heater.snapshot()
+            refusal = self._inject_refusal(snap)
             if refusal:
                 self.status = f"refused: {refusal}"
                 return
-            ok, msg = self.cycle.start(int(self.entry))
+            # Block temperature for the pull-back: the probe, or the
+            # setpoint while there is no reading.
+            block_c = snap.temp_c
+            if block_c is None and snap.enabled:
+                block_c = snap.setpoint_c
+            self._cycle_ff_j = 0.0
+            ok, msg = self.cycle.start(int(self.entry), block_c)
             self.status = msg if ok else f"refused: {msg}"
             return
 
@@ -986,7 +1096,7 @@ class JogUI:
                     if self.cycle.running:
                         self.status = cycle_state
                     elif cycle_state in (InjectCycle.DONE, InjectCycle.FAILED):
-                        self.status = self.cycle.message
+                        self.status = self._cycle_summary()
                 elif state != last_state:
                     last_state = state
                     if not self.cycle.running:
@@ -1076,8 +1186,16 @@ def main():
           f"setpoint {saved.get('setpoint_c', heater_mod.DEFAULT_SETPOINT_C)} {DEG}C, "
           f"{'ON' if saved.get('heater_on') else 'off'} at start, "
           f"offset {saved.get('sensor_offset_k', 0.0):+.2f} K, "
+          f"{heater_mod.HEATER_MAX_W:g} W, "
           f"PI {heater_mod.KP_W_PER_K:g} W/K / {heater_mod.TI_S:g} s, "
-          f"feed-forward x{heater_mod.FF_GAIN:g}")
+          f"feed-forward x{heater_mod.FF_GAIN:g} over {heater_mod.FF_SPREAD_S:g} s")
+    if PULLBACK_ENABLED:
+        print(f"pull-back: {KOH_EXPANSION_VS_WATER:g} x expansion + "
+              f"{PULLBACK_MARGIN_UL:g} {MICRO}l after {PULLBACK_DELAY_S:g} s "
+              f"(1000 {MICRO}l at 60 {DEG}C: {pullback_ul(1000, 60):.1f} {MICRO}l), "
+              f"{'compensated' if PULLBACK_COMPENSATE else 'not compensated'}")
+    else:
+        print("pull-back: off")
     JogUI().run()
 
 

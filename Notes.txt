@@ -1,6 +1,9 @@
 Quick lines
 
 ssh biometric@BiometricRaspberryPi.local
+cd ~/Raspberry
+source env/bin/activate
+
 ping BiometricRaspberryPi.local
 
 python3 blink.py
@@ -13,7 +16,7 @@ Folder:
 cd ~/Raspberry
 
 # create a virtual environment named "env" in this folder
-python3 -m venv env
+Only once, already set up (python3 -m venv --system-site-packages env)
 
 # activate environment (your prompt will change to show "(env)" at the start)
 source env/bin/activate
@@ -24,3 +27,5 @@ pip install RpiMotorLib RPi.GPIO
 
 # run your script while the venv is active
 python3 ActuatorDriver.py
+
+28-0000063dd85d  w1_bus_master1

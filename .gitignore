@@ -1,0 +1,8 @@
+# Written on the Pi at run time
+logs/
+settings.json
+settings.json.tmp
+
+# Python
+__pycache__/
+env/

@@ -33,7 +33,7 @@ VALVE_IN2 = 27      # header pin 13 -> DRV8871 IN2
                     # header pin 9 (GND) -> DRV8871 logic GND
 
 # ---------------------------------------------------------------------------
-# Heater: 24 V 50 W cartridge through a logic-level MOSFET (heater.py)
+# Heater: 24 V 60 W cartridge through a logic-level MOSFET (heater.py)
 # ---------------------------------------------------------------------------
 HEATER_GATE = 22    # header pin 15. Pulled down at boot, so the heater stays
                     # off until the program takes over. Fit a gate pull-down
